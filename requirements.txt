@@ -1,0 +1,21 @@
+# Core web framework
+streamlit==1.47.0
+
+# LLM client — OpenRouter (dev) or HPC-hosted endpoint (prod).
+# OpenRouter is OpenAI-API-compatible; no billing change needed in code.
+openai>=1.30.0
+
+# Bioinformatics
+biopython==1.85
+PyMuPDF==1.26.3
+
+# Data / viz
+numpy==2.3.1
+pandas==2.3.1
+plotly==6.2.0
+
+# HTTP
+requests==2.32.4
+
+# Misc
+python-dotenv==1.1.1
