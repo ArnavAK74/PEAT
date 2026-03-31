@@ -2,7 +2,7 @@
 
 > RAG-powered structural biology assistant for the KhareLab.
 
-**Live site**: https://kharelab.github.io/PEAT
+**Live site**: (https://arnavak74.github.io/PEAT/)
 
 ## What it does
 
