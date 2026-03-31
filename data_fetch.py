@@ -37,16 +37,16 @@ def get_unpaywall_data(doi: str, email: str) -> dict | None:
 
 
 def fetch_pdf_text(pdf_url: str, max_chars: int = 10000) -> str:
-    """
-    Downloads a PDF and extracts up to max_chars of text.
-    """
-    r = requests.get(pdf_url)
-    r.raise_for_status()
-    with open("temp.pdf", "wb") as f:
-        f.write(r.content)
-    doc = fitz.open("temp.pdf")
-    text = "".join(page.get_text() for page in doc)
-    return text[:max_chars]
+    try:
+        r = requests.get(pdf_url, timeout=15)
+        r.raise_for_status()
+        with open("temp.pdf", "wb") as f:
+            f.write(r.content)
+        doc = fitz.open("temp.pdf")
+        text = "".join(page.get_text() for page in doc)
+        return text[:max_chars]
+    except Exception:
+        return ""
 
 
 def chunk_pdf_sections(pdf_path: str) -> list[str]:
