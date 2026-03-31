@@ -4,7 +4,7 @@ HPC command execution tool for PEAT.
 
 Dev mode  : runs the command locally (useful for testing gmx on a workstation).
 Prod mode : SSH into the HPC login node and submit via the SLURM/PBS wrapper
-            configured in HPC_HOST / HPC_USER / HPC_KEY_PATH env vars.
+            configured in HPC_HOST / HPC_USER / HPC_PRIVATE_KEY env vars.
 
 Safety guardrails
 -----------------
@@ -14,8 +14,10 @@ Safety guardrails
 """
 
 import os
+import stat
 import subprocess
 import shlex
+import tempfile
 
 # ── Config ────────────────────────────────────────────────────────────────────
 _ALLOWED_PREFIXES = {
@@ -29,7 +31,6 @@ _MAX_OUTPUT_CHARS = 4000
 # SSH settings (prod)
 _HPC_HOST    = os.getenv("HPC_HOST", "")
 _HPC_USER    = os.getenv("HPC_USER", "")
-_HPC_KEY     = os.getenv("HPC_KEY_PATH", "~/.ssh/id_rsa")
 _HPC_WORKDIR = os.getenv("HPC_WORKDIR", "~/peat_runs")
 
 
@@ -41,9 +42,8 @@ def run_hpc_command(cmd: str) -> str:
     - If HPC_HOST is set → SSH to the HPC login node.
     - Otherwise         → run locally (dev / workstation with gmx installed).
     """
-    # Safety: check allowed prefix
     try:
-        first_token = shlex.split(cmd)[0].split("/")[-1]  # handle /usr/bin/gmx etc.
+        first_token = shlex.split(cmd)[0].split("/")[-1]
     except ValueError:
         return "ERROR: could not parse command."
 
@@ -80,11 +80,33 @@ def _run_local(cmd: str) -> str:
 def _run_remote(cmd: str) -> str:
     """
     SSH into HPC_HOST and run the command in HPC_WORKDIR.
-    Requires password-less SSH key auth (set HPC_KEY_PATH).
+
+    Reads the private key from the HPC_PRIVATE_KEY environment variable,
+    writes it to a temporary file with mode 600, uses it for authentication,
+    then deletes it immediately after the command finishes.
     """
-    ssh_cmd = (
-        f"ssh -i {_HPC_KEY} -o StrictHostKeyChecking=no "
-        f"{_HPC_USER}@{_HPC_HOST} "
-        f"'cd {_HPC_WORKDIR} && {cmd}'"
-    )
-    return _run_local(ssh_cmd)
+    private_key = os.getenv("HPC_PRIVATE_KEY", "")
+    if not private_key:
+        return "ERROR: HPC_PRIVATE_KEY env var is not set."
+
+    key_file = None
+    try:
+        # Write key to a secure temp file
+        fd, key_path = tempfile.mkstemp(prefix="peat_hpc_", suffix=".pem")
+        key_file = key_path
+        os.write(fd, private_key.encode())
+        os.close(fd)
+        os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)  # 600
+
+        ssh_cmd = (
+            f"ssh "
+            f"-i {key_path} "
+            f"-o StrictHostKeyChecking=no "
+            f"-o BatchMode=yes "
+            f"{_HPC_USER}@{_HPC_HOST} "
+            f"'cd {_HPC_WORKDIR} && {cmd}'"
+        )
+        return _run_local(ssh_cmd)
+    finally:
+        if key_file and os.path.exists(key_file):
+            os.remove(key_file)
