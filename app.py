@@ -209,10 +209,17 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
                     temperature=0.3,
                     max_tokens=1000,
                 )
-                gpt_summary = json.loads(resp.choices[0].message.content)
-            except Exception as e:
-                st.warning(f"LLM annotation summary failed: {e}")
-
+                raw = resp.choices[0].message.content.strip()
+                # strip markdown code fences if model wraps in ```json
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                    raw = re.sub(r"\n?```$", "", raw)
+                try:
+                    gpt_summary = json.loads(raw)
+                except Exception:
+                    gpt_summary = {"Structure": [], "Function": [raw], "Sequence": []}
+                            except Exception as e:
+                                st.warning(f"LLM annotation summary failed: {e}")
         # ── Layout ────────────────────────────────────────────────────────────
         st.subheader(f"Results for {pdb_id.upper()}")
         tab1, tab2, tab3 = st.tabs(["Literature & Catalysis", "Sequence & Domains", "Mutations & Predictions"])
