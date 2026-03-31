@@ -16,7 +16,7 @@ from data_fetch import (
     fetch_uniprot_features,
     get_pdb_id_from_sequence,
 )
-from structure_tools import build_3dmol_html, find_hotspots
+from structure_tools import build_3dmol_html
 from sequence_tools import conservation_scores, run_blast
 from predictors import predict_ddg_dynamut
 from ui import plot_domains, plot_conservation
@@ -173,8 +173,6 @@ def _run_analysis(pdb_id: str, user_question: str) -> tuple[str, list]:
         uniprot_id  = None
         up_features = {"features": [], "comments": [], "proteinDescription": {}, "genes": []}
 
-    hotspots = find_hotspots("temp.pdb")
-
     # UniProt annotation summary via LLM
     gpt_summary = {}
     if up_features.get("comments"):
@@ -267,7 +265,6 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
         f"Analysis complete for **{pdb_id}**.\n"
         f"- **Protein:** {name} | **Gene:** {gene} | **EC:** {ec}\n"
         f"- **Paper:** _{title}_ ({journal}) — DOI: {doi}\n"
-        f"- **Hotspots detected:** {', '.join(hotspots) if hotspots else 'none'}\n"
     )
     if gpt_summary.get("Function"):
         text_summary += "**Functional notes:**\n" + "\n".join(f"- {b}" for b in gpt_summary["Function"]) + "\n"
@@ -320,10 +317,6 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
 
     # Tab 3: Mutations & Predictions
     tab3 = [
-        {"type": "markdown", "data":
-            "### Structural Hotspots\n"
-            + (", ".join(f"`{h}`" for h in hotspots) if hotspots else "_No hotspots detected._")
-        },
         {"type": "markdown", "data": "### Mutation ΔΔG Predictions"},
         {"type": "mutation_form", "data": None, "key": f"mutate_{pdb_id}"},
     ]

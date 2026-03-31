@@ -1,7 +1,3 @@
-from Bio.PDB import PDBParser
-import numpy as np
-
-
 def build_3dmol_html(pdb_id: str) -> str:
     """
     Returns HTML string for embedding a 3Dmol.js viewer of the PDB entry.
@@ -19,27 +15,3 @@ def build_3dmol_html(pdb_id: str) -> str:
   }});
 </script>
 """  # noqa: E501
-
-
-def find_hotspots(pdb_path: str, contact_threshold: int = 30, distance_cutoff: float = 6.0) -> list[str]:
-    """
-    Identifies residues with more than contact_threshold atoms within distance_cutoff Å.
-    Returns list of residue identifiers (e.g. 'A123').
-    """
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('X', pdb_path)
-    atoms = list(structure.get_atoms())
-    hotspots = []
-    for model in structure:
-        for chain in model:
-            for res in chain:
-                if 'CA' not in res:
-                    continue
-                ca = res['CA'].get_vector()
-                count = sum(
-                    1 for atom in atoms
-                    if (atom.get_vector() - ca).norm() < distance_cutoff
-                )
-                if count > contact_threshold:
-                    hotspots.append(f"{chain.id}{res.id[1]}")
-    return sorted(hotspots)
