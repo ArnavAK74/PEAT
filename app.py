@@ -41,7 +41,17 @@ _HPC_PREFIXES = {
     "squeue", "sacct", "sbatch", "scancel",
     "echo", "ls", "cat", "head", "tail",
 }
-_PDB_RE = re.compile(r'\b([0-9][A-Za-z0-9]{3})\b')
+# Matches messages whose *intent* is to analyze a PDB ID:
+#   "6B5X" | "analyze 6B5X" | "fetch pdb 6B5X" | "look up 6B5X"
+# Does NOT match PDB IDs embedded in longer questions.
+_ANALYZE_RE = re.compile(
+    r'^\s*'
+    r'(?:(?:analyze|analyse|fetch|show|load|look\s*up|get|examine|study|open|run)\s+)?'
+    r'(?:pdb\s+)?'
+    r'([0-9][A-Za-z0-9]{3})'
+    r'\s*$',
+    re.IGNORECASE,
+)
 
 # ── Page config ─────────────────────────────────────────────────────────────────
 st.set_page_config(layout="wide", page_title="PEAT – Protein Engineering Agent Toolkit")
@@ -54,6 +64,9 @@ if "messages" not in st.session_state:
 if "chat_display" not in st.session_state:
     # Full display items including rich artifacts
     st.session_state.chat_display = []
+if "analyzed_pdb_ids" not in st.session_state:
+    # Set of PDB IDs already analyzed this session
+    st.session_state.analyzed_pdb_ids = set()
 
 
 # ── RAG helper ──────────────────────────────────────────────────────────────────
@@ -335,8 +348,9 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
 
 
 # ── Intent helpers ──────────────────────────────────────────────────────────────
-def _extract_pdb_id(text: str) -> str | None:
-    m = _PDB_RE.search(text)
+def _parse_analyze_request(text: str) -> str | None:
+    """Return the PDB ID if the message is a request to analyze one, else None."""
+    m = _ANALYZE_RE.match(text)
     return m.group(1).upper() if m else None
 
 def _is_hpc_command(text: str) -> bool:
@@ -389,21 +403,38 @@ if hasattr(st.session_state, "_pending_pdb"):
         st.markdown(user_msg)
 
     with st.chat_message("assistant"):
-        with st.spinner(f"Analyzing {pdb_id}…"):
-            try:
-                text_summary, artifacts = _run_analysis(pdb_id, question)
-                st.markdown(text_summary)
-                for artifact in artifacts:
-                    _render_artifact(artifact)
-                st.session_state.messages.append({"role": "assistant", "content": text_summary})
-                st.session_state.chat_display.append({
-                    "role": "assistant", "content": text_summary, "artifacts": artifacts,
-                })
-            except Exception as e:
-                err = f"Analysis failed: {e}"
-                st.error(err)
-                st.session_state.messages.append({"role": "assistant", "content": err})
-                st.session_state.chat_display.append({"role": "assistant", "content": err})
+        if pdb_id in st.session_state.analyzed_pdb_ids:
+            with st.spinner("Thinking…"):
+                try:
+                    resp = client.chat.completions.create(
+                        model=_model,
+                        messages=st.session_state.messages,
+                        temperature=0.3,
+                        max_tokens=1000,
+                    )
+                    answer = resp.choices[0].message.content
+                except Exception as e:
+                    answer = f"LLM error: {e}"
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.session_state.chat_display.append({"role": "assistant", "content": answer})
+        else:
+            with st.spinner(f"Analyzing {pdb_id}…"):
+                try:
+                    text_summary, artifacts = _run_analysis(pdb_id, question)
+                    st.markdown(text_summary)
+                    for artifact in artifacts:
+                        _render_artifact(artifact)
+                    st.session_state.analyzed_pdb_ids.add(pdb_id)
+                    st.session_state.messages.append({"role": "assistant", "content": text_summary})
+                    st.session_state.chat_display.append({
+                        "role": "assistant", "content": text_summary, "artifacts": artifacts,
+                    })
+                except Exception as e:
+                    err = f"Analysis failed: {e}"
+                    st.error(err)
+                    st.session_state.messages.append({"role": "assistant", "content": err})
+                    st.session_state.chat_display.append({"role": "assistant", "content": err})
     st.rerun()
 
 
@@ -415,9 +446,20 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Route: protein analysis
-    pdb_id = _extract_pdb_id(prompt)
-    if pdb_id:
+    pdb_id = _parse_analyze_request(prompt)
+
+    # Route: HPC command (checked first — unambiguous prefix match)
+    if _is_hpc_command(prompt):
+        with st.chat_message("assistant"):
+            with st.spinner("Running HPC command…"):
+                hpc_output = run_hpc_command(prompt.strip())
+            response = f"**HPC Output:**\n```bash\n{hpc_output}\n```"
+            st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": hpc_output})
+            st.session_state.chat_display.append({"role": "assistant", "content": response})
+
+    # Route: new protein analysis
+    elif pdb_id and pdb_id not in st.session_state.analyzed_pdb_ids:
         with st.chat_message("assistant"):
             with st.spinner(f"Analyzing {pdb_id}…"):
                 try:
@@ -425,6 +467,7 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
                     st.markdown(text_summary)
                     for artifact in artifacts:
                         _render_artifact(artifact)
+                    st.session_state.analyzed_pdb_ids.add(pdb_id)
                     st.session_state.messages.append({"role": "assistant", "content": text_summary})
                     st.session_state.chat_display.append({
                         "role": "assistant", "content": text_summary, "artifacts": artifacts,
@@ -435,17 +478,7 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
                     st.session_state.messages.append({"role": "assistant", "content": err})
                     st.session_state.chat_display.append({"role": "assistant", "content": err})
 
-    # Route: HPC command
-    elif _is_hpc_command(prompt):
-        with st.chat_message("assistant"):
-            with st.spinner("Running HPC command…"):
-                hpc_output = run_hpc_command(prompt.strip())
-            response = f"**HPC Output:**\n```bash\n{hpc_output}\n```"
-            st.markdown(response)
-            st.session_state.messages.append({"role": "assistant", "content": hpc_output})
-            st.session_state.chat_display.append({"role": "assistant", "content": response})
-
-    # Route: conversational LLM with full history
+    # Route: LLM with full history (questions, follow-ups, already-analyzed PDB IDs)
     else:
         with st.chat_message("assistant"):
             with st.spinner("Thinking…"):
