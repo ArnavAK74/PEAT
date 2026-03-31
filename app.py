@@ -1,91 +1,64 @@
 # app.py
 import os
 import re
-import requests
 import json
+import requests
 
 import streamlit as st
-from openai import OpenAI  # OpenRouter is OpenAI-compatible
+from openai import OpenAI
 
-from data_fetch       import (
+from data_fetch import (
     get_pdb_data,
     get_uniprot_ids_from_sifts,
     get_unpaywall_data,
     fetch_pdf_text,
     get_m_csa_active_sites,
     fetch_uniprot_features,
-    get_pdb_id_from_sequence
+    get_pdb_id_from_sequence,
 )
-from structure_tools  import build_3dmol_html, find_hotspots
-from sequence_tools   import conservation_scores, run_blast
-from predictors       import predict_ddg_dynamut
-from ui               import plot_domains, plot_conservation, show_mutation_form
-from hpc_tools        import run_hpc_command
+from structure_tools import build_3dmol_html, find_hotspots
+from sequence_tools import conservation_scores, run_blast
+from predictors import predict_ddg_dynamut
+from ui import plot_domains, plot_conservation
+from hpc_tools import run_hpc_command
 
-# ── LLM client ────────────────────────────────────────────────────────────────
-# Dev:  set OPENROUTER_API_KEY + LLM_BASE_URL=https://openrouter.ai/api/v1
-# Prod: set LLM_BASE_URL to your HPC-hosted endpoint (e.g. vLLM/Ollama on HPC)
+# ── LLM client ─────────────────────────────────────────────────────────────────
 _api_key  = os.getenv("OPENROUTER_API_KEY", "")
 _base_url = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 _model    = os.getenv("LLM_MODEL", "mistralai/mistral-7b-instruct:free")
+client    = OpenAI(api_key=_api_key, base_url=_base_url)
+EMAIL     = os.getenv("UNPAYWALL_EMAIL", "")
 
-client = OpenAI(api_key=_api_key, base_url=_base_url)
-EMAIL  = os.getenv("UNPAYWALL_EMAIL", "")
+_SYSTEM_PROMPT = (
+    "You are PEAT, a protein engineering assistant for the KhareLab at Rutgers University. "
+    "You help researchers analyze protein structures, interpret UniProt annotations, "
+    "understand literature, and run GROMACS simulations on Amarel HPC. "
+    "When referring to previously analyzed proteins, use the information from the conversation history."
+)
 
-# ── Page config ───────────────────────────────────────────────────────────────
+_HPC_PREFIXES = {
+    "gmx", "python", "python3", "bash", "sh",
+    "squeue", "sacct", "sbatch", "scancel",
+    "echo", "ls", "cat", "head", "tail",
+}
+_PDB_RE = re.compile(r'\b([0-9][A-Za-z0-9]{3})\b')
+
+# ── Page config ─────────────────────────────────────────────────────────────────
 st.set_page_config(layout="wide", page_title="PEAT – Protein Engineering Agent Toolkit")
 st.title("🔬 PEAT – Protein Engineering Agent Toolkit")
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("🔍 Input")
-    input_type = st.radio("Select Input Type:", ["PDB ID", "Protein Sequence"])
-    if input_type == "PDB ID":
-        pdb_id   = st.text_input("Enter PDB ID (e.g., 6B5X)").strip()
-        sequence = None
-    else:
-        sequence = st.text_area("Enter Protein Sequence (FASTA or plain AA)").strip()
-        pdb_id   = None
-
-    if sequence and not pdb_id:
-        with st.spinner("🔍 Searching for matching PDB ID..."):
-            pdb_id = get_pdb_id_from_sequence(sequence)
-            if pdb_id:
-                st.success(f"✅ Found matching PDB ID: {pdb_id}")
-            else:
-                st.error("❌ Could not find a matching PDB ID for the sequence.")
-                st.stop()
-
-    user_question = st.text_area("Your question:", "What is the function of the protein?")
-
-    st.markdown("---")
-    st.header("⚙️ HPC Command")
-    hpc_cmd = st.text_input(
-        "GROMACS / HPC command",
-        placeholder="gmx mdrun -deffnm minimize",
-        help="Short jobs only (<5 min / 16 CPU). Runs on the connected HPC resource."
-    )
-    run_hpc = st.button("▶ Run HPC Command")
-    run     = st.button("🔎 Analyze Protein")
+# ── Session state ───────────────────────────────────────────────────────────────
+if "messages" not in st.session_state:
+    # LLM context — text only, passed on every call
+    st.session_state.messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+if "chat_display" not in st.session_state:
+    # Full display items including rich artifacts
+    st.session_state.chat_display = []
 
 
-# ── HPC block ─────────────────────────────────────────────────────────────────
-if run_hpc and hpc_cmd.strip():
-    with st.spinner("⚙️ Submitting HPC job..."):
-        hpc_result = run_hpc_command(hpc_cmd.strip())
-    st.subheader("HPC Output")
-    st.code(hpc_result, language="bash")
-
-
-# ── RAG helper ────────────────────────────────────────────────────────────────
+# ── RAG helper ──────────────────────────────────────────────────────────────────
 def _fetch_paper_text(doi: str, email: str) -> str | None:
-    """
-    Priority order:
-    1. Unpaywall open-access PDF (production-safe)
-    2. Library auth cookie via LIBRARY_COOKIE env var (production)
-    3. Sci-Hub (dev only — set SCIHUB_ENABLED=true to activate)
-    """
-    # 1. Unpaywall
+    """Priority: Unpaywall → library cookie → Sci-Hub (dev only)."""
     if email:
         ua_data = get_unpaywall_data(doi, email)
         if ua_data:
@@ -96,14 +69,15 @@ def _fetch_paper_text(doi: str, email: str) -> str | None:
                 if text and len(text) > 200:
                     return text
 
-    # 2. Library auth cookie (cf. Zotero connector approach)
     lib_cookie = os.getenv("LIBRARY_COOKIE", "")
     if lib_cookie:
         try:
             import fitz, tempfile
-            r = requests.get(f"https://doi.org/{doi}",
-                             headers={"Cookie": lib_cookie},
-                             allow_redirects=True, timeout=15)
+            r = requests.get(
+                f"https://doi.org/{doi}",
+                headers={"Cookie": lib_cookie},
+                allow_redirects=True, timeout=15,
+            )
             if r.ok and "pdf" in r.headers.get("Content-Type", "").lower():
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
                     tf.write(r.content)
@@ -114,7 +88,6 @@ def _fetch_paper_text(doi: str, email: str) -> str | None:
         except Exception:
             pass
 
-    # 3. Sci-Hub fallback (dev only)
     if os.getenv("SCIHUB_ENABLED", "false").lower() == "true":
         scihub_base = os.getenv("SCIHUB_URL", "https://sci-hub.se")
         try:
@@ -134,62 +107,100 @@ def _fetch_paper_text(doi: str, email: str) -> str | None:
     return None
 
 
-# ── Main analysis ─────────────────────────────────────────────────────────────
-if run:
-    try:
-        entry = get_pdb_data(pdb_id)
+# ── Artifact renderer ───────────────────────────────────────────────────────────
+def _render_artifact(artifact: dict) -> None:
+    """Render a single artifact inside the current Streamlit container."""
+    t = artifact["type"]
+    if t == "html":
+        st.components.v1.html(artifact["data"], height=550)
+    elif t == "plotly":
+        st.plotly_chart(artifact["data"], use_container_width=True)
+    elif t == "code":
+        st.code(artifact["data"], language=artifact.get("language", ""))
+    elif t == "markdown":
+        st.markdown(artifact["data"])
+    elif t == "mutation_form":
+        form_key = artifact.get("key", "mutate_form")
+        with st.form(form_key):
+            site     = st.text_input("Residue (e.g. A123)")
+            mutation = st.text_input("Mutation (e.g. A123C)")
+            submitted = st.form_submit_button("Predict ΔΔG")
+            if submitted:
+                try:
+                    chain  = site[0]
+                    resnum = int(site[1:])
+                    result = predict_ddg_dynamut("temp.pdb", chain, resnum, mutation)
+                    st.success(f"Predicted ΔΔG: {result.get('ddg')} kCal/mol")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    elif t == "tabs":
+        tab_labels = [tab["label"] for tab in artifact["tabs"]]
+        tab_objs   = st.tabs(tab_labels)
+        for tab_obj, tab_def in zip(tab_objs, artifact["tabs"]):
+            with tab_obj:
+                for sub in tab_def["content"]:
+                    _render_artifact(sub)
 
-        pdb_url  = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb"
-        pdb_resp = requests.get(pdb_url)
-        pdb_resp.raise_for_status()
-        with open("temp.pdb", "wb") as pdb_file:
-            pdb_file.write(pdb_resp.content)
 
-        doi     = entry["rcsb_primary_citation"].get("pdbx_database_id_doi", "N/A")
-        title   = entry["rcsb_primary_citation"].get("title", "N/A")
-        authors = entry["rcsb_primary_citation"].get("rcsb_authors", [])
-        journal = entry["rcsb_primary_citation"].get("rcsb_journal_abbrev", "N/A")
+# ── Analysis pipeline ───────────────────────────────────────────────────────────
+def _run_analysis(pdb_id: str, user_question: str) -> tuple[str, list]:
+    """
+    Fetch and process all data for a PDB ID.
+    Returns (text_summary, artifacts) where text_summary goes into LLM context
+    and artifacts are rendered in the chat message.
+    """
+    pdb_id = pdb_id.upper()
 
-        m_csa_sites = get_m_csa_active_sites(pdb_id)
+    entry = get_pdb_data(pdb_id)
 
-        uniprot_ids = get_uniprot_ids_from_sifts(pdb_id)
-        if uniprot_ids:
-            uniprot_id  = uniprot_ids[0]
-            up_features = fetch_uniprot_features(uniprot_id)
-        else:
-            uniprot_id  = None
-            up_features = {"features": [], "comments": [], "proteinDescription": {}, "genes": []}
+    pdb_resp = requests.get(f"https://files.rcsb.org/download/{pdb_id}.pdb")
+    pdb_resp.raise_for_status()
+    with open("temp.pdb", "wb") as f:
+        f.write(pdb_resp.content)
 
-        hotspots    = find_hotspots("temp.pdb")
-        gpt_summary = {}
+    citation = entry.get("rcsb_primary_citation", {})
+    doi      = citation.get("pdbx_database_id_doi", "N/A")
+    title    = citation.get("title", "N/A")
+    authors  = citation.get("rcsb_authors", [])
+    journal  = citation.get("rcsb_journal_abbrev", "N/A")
 
-        # ── UniProt annotation summary via LLM ────────────────────────────────
-        if up_features.get("comments"):
-            all_texts = []
-            for comment in up_features["comments"]:
-                if comment.get("texts"):
-                    for text in comment["texts"]:
-                        all_texts.append(text.get("value", ""))
-                elif comment.get("commentType") == "CATALYTIC ACTIVITY":
-                    reaction = comment.get("reaction", {}).get("name", "")
-                    ec       = comment.get("reaction", {}).get("ecNumber", "")
-                    if reaction:
-                        all_texts.append(f"Catalytic Activity: {reaction} (EC {ec})")
-                elif comment.get("commentType") == "SUBCELLULAR LOCATION":
-                    for loc in comment.get("subcellularLocations", []):
-                        val = loc.get("location", {}).get("value", "")
-                        if val:
-                            all_texts.append(f"Subcellular Location: {val}")
-                elif comment.get("commentType") == "INTERACTION":
-                    for interaction in comment.get("interactions", []):
-                        g1    = interaction.get("interactantOne", {}).get("geneName", "")
-                        g2    = interaction.get("interactantTwo", {}).get("geneName", "")
-                        count = interaction.get("numberOfExperiments", 0)
-                        all_texts.append(f"Interaction: {g1} ↔ {g2} ({count} experiments)")
+    m_csa_sites = get_m_csa_active_sites(pdb_id)
+    uniprot_ids = get_uniprot_ids_from_sifts(pdb_id)
+    if uniprot_ids:
+        uniprot_id  = uniprot_ids[0]
+        up_features = fetch_uniprot_features(uniprot_id)
+    else:
+        uniprot_id  = None
+        up_features = {"features": [], "comments": [], "proteinDescription": {}, "genes": []}
 
-            combined_text = "\n".join(all_texts)
-            prompt = f"""
-You're an expert assistant for structural biologists.
+    hotspots = find_hotspots("temp.pdb")
+
+    # UniProt annotation summary via LLM
+    gpt_summary = {}
+    if up_features.get("comments"):
+        all_texts = []
+        for comment in up_features["comments"]:
+            if comment.get("texts"):
+                for text in comment["texts"]:
+                    all_texts.append(text.get("value", ""))
+            elif comment.get("commentType") == "CATALYTIC ACTIVITY":
+                reaction = comment.get("reaction", {}).get("name", "")
+                ec_num   = comment.get("reaction", {}).get("ecNumber", "")
+                if reaction:
+                    all_texts.append(f"Catalytic Activity: {reaction} (EC {ec_num})")
+            elif comment.get("commentType") == "SUBCELLULAR LOCATION":
+                for loc in comment.get("subcellularLocations", []):
+                    val = loc.get("location", {}).get("value", "")
+                    if val:
+                        all_texts.append(f"Subcellular Location: {val}")
+            elif comment.get("commentType") == "INTERACTION":
+                for interaction in comment.get("interactions", []):
+                    g1    = interaction.get("interactantOne", {}).get("geneName", "")
+                    g2    = interaction.get("interactantTwo", {}).get("geneName", "")
+                    count = interaction.get("numberOfExperiments", 0)
+                    all_texts.append(f"Interaction: {g1} ↔ {g2} ({count} experiments)")
+
+        prompt = f"""You're an expert assistant for structural biologists.
 
 Summarize the following UniProt annotations into three categories:
 - Structure (domains, motifs, folding)
@@ -199,115 +210,262 @@ Summarize the following UniProt annotations into three categories:
 Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each value is a list of bullet-point strings.
 
 ---
-{combined_text}
----
-"""
+{chr(10).join(all_texts)}
+---"""
+        try:
+            resp = client.chat.completions.create(
+                model=_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=1000,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
             try:
-                resp = client.chat.completions.create(
+                gpt_summary = json.loads(raw)
+            except Exception:
+                gpt_summary = {"Structure": [], "Function": [raw], "Sequence": []}
+        except Exception:
+            gpt_summary = {}
+
+    # Literature Q&A
+    lit_answer  = None
+    paper_text  = None
+    if doi != "N/A":
+        paper_text = _fetch_paper_text(doi, EMAIL)
+        if paper_text and user_question:
+            qa_prompt = (
+                f"You are an expert research assistant for protein engineers and biochemists.\n"
+                f"Use the paper (DOI: {doi}) to answer the following question.\n\n"
+                f"Question: {user_question}\n"
+                f"---\nPaper Excerpt (first 10 000 chars):\n{paper_text}\n---\nAnswer:"
+            )
+            try:
+                lit_answer = client.chat.completions.create(
                     model=_model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[{"role": "user", "content": qa_prompt}],
                     temperature=0.3,
                     max_tokens=1000,
-                )
-                raw = resp.choices[0].message.content.strip()
-                if raw.startswith("```"):
-                    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-                    raw = re.sub(r"\n?```$", "", raw)
-                try:
-                    gpt_summary = json.loads(raw)
-                except Exception:
-                    gpt_summary = {"Structure": [], "Function": [raw], "Sequence": []}
+                ).choices[0].message.content
+            except Exception:
+                lit_answer = None
+
+    # Protein identity fields
+    prot_desc = up_features.get("proteinDescription", {})
+    rec_name  = prot_desc.get("recommendedName", {})
+    name = rec_name.get("fullName", {}).get("value", "N/A")
+    ec   = (rec_name.get("ecNumbers", [{}]) or [{}])[0].get("value", "N/A")
+    gene = (
+        up_features.get("genes", [{}])[0].get("geneName", {}).get("value", "N/A")
+        if up_features.get("genes") else "N/A"
+    )
+
+    # Text summary stored in LLM context
+    text_summary = (
+        f"Analysis complete for **{pdb_id}**.\n"
+        f"- **Protein:** {name} | **Gene:** {gene} | **EC:** {ec}\n"
+        f"- **Paper:** _{title}_ ({journal}) — DOI: {doi}\n"
+        f"- **Hotspots detected:** {', '.join(hotspots) if hotspots else 'none'}\n"
+    )
+    if gpt_summary.get("Function"):
+        text_summary += "**Functional notes:**\n" + "\n".join(f"- {b}" for b in gpt_summary["Function"]) + "\n"
+    if lit_answer:
+        text_summary += f"**Literature answer:** {lit_answer[:400]}…\n"
+
+    # ── Artifacts ──────────────────────────────────────────────────────────────
+    # Tab 1: Literature & Catalysis
+    tab1 = []
+    tab1.append({"type": "markdown", "data": (
+        "### Paper Metadata\n"
+        f"- **DOI:** {doi}\n"
+        f"- **Title:** {title}\n"
+        f"- **Authors:** {', '.join(authors)}\n"
+        f"- **Journal:** {journal}"
+    )})
+    if name != "N/A":
+        tab1.append({"type": "markdown", "data": (
+            "### UniProt Annotations\n"
+            f"- **Protein:** {name}\n"
+            f"- **EC Number:** {ec}\n"
+            f"- **Gene:** {gene}"
+        )})
+    if gpt_summary.get("Function"):
+        tab1.append({"type": "markdown", "data":
+            "### Functional Roles\n" + "\n".join(f"- {b}" for b in gpt_summary["Function"])
+        })
+    if lit_answer:
+        tab1.append({"type": "markdown", "data": f"### Literature Answer\n{lit_answer}"})
+    elif doi != "N/A" and not paper_text:
+        tab1.append({"type": "markdown", "data":
+            "_No open-access PDF found (tried Unpaywall + library cookie + Sci-Hub)._"
+        })
+
+    # Tab 2: Sequence & Domains
+    tab2 = []
+    if uniprot_id:
+        tab2.append({"type": "markdown", "data":
+            f"**UniProt:** [{uniprot_id}](https://www.uniprot.org/uniprotkb/{uniprot_id})"
+        })
+    if up_features.get("features"):
+        seq_len = entry.get("rcsb_entry_info", {}).get("polymer_monomer_count_maximum", 500)
+        tab2.append({"type": "plotly", "data": plot_domains(up_features["features"], seq_len)})
+    if gpt_summary.get("Sequence"):
+        tab2.append({"type": "markdown", "data":
+            "### Sequence Features\n" + "\n".join(f"- {b}" for b in gpt_summary["Sequence"])
+        })
+    if not tab2:
+        tab2.append({"type": "markdown", "data": "_No UniProt domain annotations found._"})
+
+    # Tab 3: Mutations & Predictions
+    tab3 = [
+        {"type": "markdown", "data":
+            "### Structural Hotspots\n"
+            + (", ".join(f"`{h}`" for h in hotspots) if hotspots else "_No hotspots detected._")
+        },
+        {"type": "markdown", "data": "### Mutation ΔΔG Predictions"},
+        {"type": "mutation_form", "data": None, "key": f"mutate_{pdb_id}"},
+    ]
+
+    artifacts = [
+        {"type": "tabs", "tabs": [
+            {"label": "Literature & Catalysis", "content": tab1},
+            {"label": "Sequence & Domains",      "content": tab2},
+            {"label": "Mutations & Predictions", "content": tab3},
+        ]},
+        {"type": "markdown", "data": "### 3D Structure Viewer"},
+        {"type": "html", "data": build_3dmol_html(pdb_id)},
+    ]
+
+    return text_summary, artifacts
+
+
+# ── Intent helpers ──────────────────────────────────────────────────────────────
+def _extract_pdb_id(text: str) -> str | None:
+    m = _PDB_RE.search(text)
+    return m.group(1).upper() if m else None
+
+def _is_hpc_command(text: str) -> bool:
+    parts = text.strip().split()
+    return bool(parts) and parts[0].lower() in _HPC_PREFIXES
+
+
+# ── Sidebar ─────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Search by Sequence")
+    seq_input = st.text_area("Protein sequence (FASTA or plain AA)", height=140)
+    if st.button("Find & Analyze PDB"):
+        if seq_input.strip():
+            with st.spinner("Searching RCSB for matching PDB…"):
+                found_id = get_pdb_id_from_sequence(seq_input.strip())
+            if found_id:
+                st.success(f"Found: {found_id}")
+                st.session_state._pending_pdb = found_id
+                st.session_state._pending_question = "What is the function of this protein?"
+            else:
+                st.error("No matching PDB found.")
+        else:
+            st.warning("Enter a sequence first.")
+
+    st.markdown("---")
+    st.caption(
+        "Or type a PDB ID (e.g. `Analyze 6B5X`) or an HPC command "
+        "(e.g. `gmx mdrun -deffnm em`) directly in the chat below."
+    )
+
+
+# ── Render chat history ─────────────────────────────────────────────────────────
+for item in st.session_state.chat_display:
+    with st.chat_message(item["role"]):
+        if item.get("content"):
+            st.markdown(item["content"])
+        for artifact in item.get("artifacts", []):
+            _render_artifact(artifact)
+
+
+# ── Handle sequence → PDB injection from sidebar ───────────────────────────────
+if hasattr(st.session_state, "_pending_pdb"):
+    pdb_id   = st.session_state.pop("_pending_pdb")
+    question = st.session_state.pop("_pending_question", "")
+    user_msg = f"Analyze {pdb_id}" + (f" — {question}" if question else "")
+
+    st.session_state.messages.append({"role": "user", "content": user_msg})
+    st.session_state.chat_display.append({"role": "user", "content": user_msg})
+    with st.chat_message("user"):
+        st.markdown(user_msg)
+
+    with st.chat_message("assistant"):
+        with st.spinner(f"Analyzing {pdb_id}…"):
+            try:
+                text_summary, artifacts = _run_analysis(pdb_id, question)
+                st.markdown(text_summary)
+                for artifact in artifacts:
+                    _render_artifact(artifact)
+                st.session_state.messages.append({"role": "assistant", "content": text_summary})
+                st.session_state.chat_display.append({
+                    "role": "assistant", "content": text_summary, "artifacts": artifacts,
+                })
             except Exception as e:
-                st.warning(f"LLM annotation summary failed: {e}")
-        # ── Layout ────────────────────────────────────────────────────────────
-        st.subheader(f"Results for {pdb_id.upper()}")
-        tab1, tab2, tab3 = st.tabs(["Literature & Catalysis", "Sequence & Domains", "Mutations & Predictions"])
+                err = f"Analysis failed: {e}"
+                st.error(err)
+                st.session_state.messages.append({"role": "assistant", "content": err})
+                st.session_state.chat_display.append({"role": "assistant", "content": err})
+    st.rerun()
 
-        with tab1:
-            st.markdown("### 📄 Paper Metadata")
-            st.markdown(f"- **DOI:** {doi}")
-            st.markdown(f"- **Title:** {title}")
-            st.markdown(f"- **Authors:** {', '.join(authors)}")
-            st.markdown(f"- **Journal:** {journal}")
 
-            if up_features and "proteinDescription" in up_features:
-                st.markdown("### 🧬 UniProt Functional Annotations")
-                name = (up_features.get("proteinDescription", {})
-                        .get("recommendedName", {})
-                        .get("fullName", {}).get("value", "N/A"))
-                ec   = (up_features.get("proteinDescription", {})
-                        .get("recommendedName", {})
-                        .get("ecNumbers", [{}])[0].get("value", "N/A"))
-                genes_list = up_features.get("genes", [])
-                gene       = genes_list[0].get("geneName", {}).get("value", "N/A") if genes_list else "N/A"
-                st.markdown(f"- **Protein Name:** {name}")
-                st.markdown(f"- **EC Number:** {ec}")
-                st.markdown(f"- **Gene:** {gene}")
+# ── Chat input loop ─────────────────────────────────────────────────────────────
+if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an HPC command…"):
+    # Display user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.chat_display.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-            with st.expander("🧬 Functional Roles (Click to expand)"):
-                for func in gpt_summary.get("Function", []):
-                    st.markdown(f"- {func}")
+    # Route: protein analysis
+    pdb_id = _extract_pdb_id(prompt)
+    if pdb_id:
+        with st.chat_message("assistant"):
+            with st.spinner(f"Analyzing {pdb_id}…"):
+                try:
+                    text_summary, artifacts = _run_analysis(pdb_id, prompt)
+                    st.markdown(text_summary)
+                    for artifact in artifacts:
+                        _render_artifact(artifact)
+                    st.session_state.messages.append({"role": "assistant", "content": text_summary})
+                    st.session_state.chat_display.append({
+                        "role": "assistant", "content": text_summary, "artifacts": artifacts,
+                    })
+                except Exception as e:
+                    err = f"Analysis failed: {e}"
+                    st.error(err)
+                    st.session_state.messages.append({"role": "assistant", "content": err})
+                    st.session_state.chat_display.append({"role": "assistant", "content": err})
 
-            st.markdown("### 🧠 LLM Answer to Your Question")
+    # Route: HPC command
+    elif _is_hpc_command(prompt):
+        with st.chat_message("assistant"):
+            with st.spinner("Running HPC command…"):
+                hpc_output = run_hpc_command(prompt.strip())
+            response = f"**HPC Output:**\n```bash\n{hpc_output}\n```"
+            st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": hpc_output})
+            st.session_state.chat_display.append({"role": "assistant", "content": response})
 
-            if doi != "N/A":
-                paper_text = _fetch_paper_text(doi, EMAIL)
-                if paper_text:
-                    prompt = f"""
-You are an expert research assistant for protein engineers and biochemists.
-Use the paper (DOI: {doi}) to answer the following question.
-
-Question: {user_question}
----
-Paper Excerpt (first 10 000 chars):
-{paper_text}
----
-Answer:"""
-                    try:
-                        answer = client.chat.completions.create(
-                            model=_model,
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.3,
-                            max_tokens=1000,
-                        ).choices[0].message.content
-
-                        st.success("Answer generated:")
-                        st.write(answer)
-
-                        with st.expander("📄 Show Paper Excerpt (first 10 000 chars)"):
-                            st.write(paper_text)
-                    except Exception as e:
-                        st.warning(f"LLM failed: {e}")
-                else:
-                    st.warning("No open-access PDF found (tried Unpaywall + library cookie + Sci-Hub).")
-            else:
-                st.warning("DOI not found; skipping LLM literature summary.")
-
-        with tab2:
-            st.markdown("### Sequence Features & Domains")
-            if uniprot_id:
-                st.markdown(f"**UniProt Accession**: [{uniprot_id}](https://www.uniprot.org/uniprotkb/{uniprot_id})")
-            if up_features and up_features.get("features"):
-                st.plotly_chart(
-                    plot_domains(up_features["features"],
-                                 entry["rcsb_entry_info"]["polymer_monomer_count_maximum"]),
-                    use_container_width=True
-                )
-                with st.expander("🧬 Sequence Information (Click to expand)"):
-                    for seq_item in gpt_summary.get("Sequence", []):
-                        st.markdown(f"- {seq_item}")
-            else:
-                st.write("🔍 No UniProt domain annotations found.")
-
-        with tab3:
-            st.markdown("### Structural Hotspots")
-            st.write(hotspots or "No hotspots detected.")
-            st.markdown("---")
-            st.markdown("### Mutation ΔΔG Predictions")
-            show_mutation_form()
-
-        st.markdown("### 🧬 3D Structure Viewer")
-        st.components.v1.html(build_3dmol_html(pdb_id), height=550)
-
-    except Exception as e:
-        st.error(f"❌ Error: {e}")
+    # Route: conversational LLM with full history
+    else:
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                try:
+                    resp = client.chat.completions.create(
+                        model=_model,
+                        messages=st.session_state.messages,
+                        temperature=0.3,
+                        max_tokens=1000,
+                    )
+                    answer = resp.choices[0].message.content
+                except Exception as e:
+                    answer = f"LLM error: {e}"
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.session_state.chat_display.append({"role": "assistant", "content": answer})
