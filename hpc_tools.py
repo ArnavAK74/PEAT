@@ -89,6 +89,15 @@ def _run_remote(cmd: str) -> str:
     if not private_key:
         return "ERROR: HPC_PRIVATE_KEY env var is not set."
 
+    # Replace literal \n with real newlines (common when set via env/secrets)
+    private_key = private_key.replace("\\n", "\n")
+    # Ensure the key ends with a newline (required by OpenSSH)
+    if not private_key.endswith("\n"):
+        private_key += "\n"
+
+    print(f"[HPC] key first 20: {repr(private_key[:20])}")
+    print(f"[HPC] key last  20: {repr(private_key[-20:])}")
+
     key_file = None
     try:
         # Write key to a secure temp file
