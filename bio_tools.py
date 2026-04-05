@@ -50,16 +50,21 @@ def foldseek_search(pdb_id: str) -> dict:
         time.sleep(5)
         poll = requests.get(f"{_FOLDSEEK_URL}/ticket/{ticket_id}", timeout=15)
         poll.raise_for_status()
-        data = poll.json()
-        status = data.get("status", "")
+        status_data = poll.json()
+        status = status_data.get("status", "")
         if status == "COMPLETE":
             break
         if status == "ERROR":
-            raise RuntimeError(f"Foldseek job failed for {pdb_id}: {data}")
+            raise RuntimeError(f"Foldseek job failed for {pdb_id}: {status_data}")
     else:
         raise TimeoutError(f"Foldseek job timed out after 5 minutes for {pdb_id}")
 
-    # ── 4. Parse hits ────────────────────────────────────────────────────────────
+    # ── 4. Fetch results from the result endpoint ────────────────────────────────
+    result_resp = requests.get(f"{_FOLDSEEK_URL}/result/{ticket_id}/0", timeout=30)
+    result_resp.raise_for_status()
+    data = result_resp.json()
+
+    # ── 5. Parse hits ────────────────────────────────────────────────────────────
     hits = []
     for db_result in data.get("results", []):
         # alignments is a list-of-lists: one inner list per query sequence
