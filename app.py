@@ -21,7 +21,7 @@ from sequence_tools import conservation_scores, run_blast
 from predictors import predict_ddg_dynamut
 from ui import plot_domains, plot_conservation
 from hpc_tools import run_hpc_command
-from bio_tools import foldseek_search
+from bio_tools import foldseek_search, alphafold_fetch
 
 # ── LLM client ─────────────────────────────────────────────────────────────────
 _api_key  = os.getenv("OPENROUTER_API_KEY", "")
@@ -42,6 +42,18 @@ _HPC_PREFIXES = {
     "squeue", "sacct", "sbatch", "scancel",
     "echo", "ls", "cat", "head", "tail",
 }
+# Matches messages whose intent is to fetch an AlphaFold structure:
+#   "alphafold Q9WYE2" | "fetch alphafold Q9WYE2" | "af2 Q9WYE2"
+_ALPHAFOLD_RE = re.compile(
+    r'^\s*'
+    r'(?:(?:fetch|get|show|load)\s+)?'
+    r'(?:alphafold|af2|af)\s+'
+    r'(?:for\s+)?'
+    r'([A-Za-z0-9]+)'
+    r'\s*$',
+    re.IGNORECASE,
+)
+
 # Matches messages whose intent is to run a Foldseek search:
 #   "foldseek 6B5X" | "similar structures 6B5X" | "find similar to 6B5X"
 _FOLDSEEK_RE = re.compile(
@@ -184,11 +196,6 @@ def _run_analysis(pdb_id: str, user_question: str) -> tuple[str, list]:
 
     entry = get_pdb_data(pdb_id)
 
-    pdb_resp = requests.get(f"https://files.rcsb.org/download/{pdb_id}.pdb")
-    pdb_resp.raise_for_status()
-    with open("temp.pdb", "wb") as f:
-        f.write(pdb_resp.content)
-
     citation = entry.get("rcsb_primary_citation", {})
     doi      = citation.get("pdbx_database_id_doi", "N/A")
     title    = citation.get("title", "N/A")
@@ -203,6 +210,28 @@ def _run_analysis(pdb_id: str, user_question: str) -> tuple[str, list]:
     else:
         uniprot_id  = None
         up_features = {"features": [], "comments": [], "proteinDescription": {}, "genes": []}
+
+    # Try experimental structure; fall back to AlphaFold if unavailable
+    af_result = None
+    try:
+        pdb_resp = requests.get(
+            f"https://files.rcsb.org/download/{pdb_id}.pdb", timeout=30
+        )
+        pdb_resp.raise_for_status()
+        with open("temp.pdb", "wb") as f:
+            f.write(pdb_resp.content)
+        structure_source = "experimental"
+    except Exception:
+        if uniprot_id:
+            af_result = alphafold_fetch(uniprot_id)
+            import shutil
+            shutil.copy(af_result["pdb_path"], "temp.pdb")
+            structure_source = "alphafold"
+        else:
+            raise RuntimeError(
+                f"Could not download experimental structure for {pdb_id} "
+                "and no UniProt ID available for AlphaFold fallback."
+            )
 
     # UniProt annotation summary via LLM
     gpt_summary = {}
@@ -297,6 +326,13 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
         f"- **Protein:** {name} | **Gene:** {gene} | **EC:** {ec}\n"
         f"- **Paper:** _{title}_ ({journal}) — DOI: {doi}\n"
     )
+    if structure_source == "alphafold" and af_result:
+        text_summary += (
+            f"- **Structure:** AlphaFold model ({af_result['entry_id']}) — "
+            f"no experimental PDB available. "
+            f"Mean pLDDT: {af_result['plddt_mean']} "
+            f"(min {af_result['plddt_min']}, max {af_result['plddt_max']})\n"
+        )
     if gpt_summary.get("Function"):
         text_summary += "**Functional notes:**\n" + "\n".join(f"- {b}" for b in gpt_summary["Function"]) + "\n"
     if lit_answer:
@@ -343,6 +379,14 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
         tab2.append({"type": "markdown", "data":
             "### Sequence Features\n" + "\n".join(f"- {b}" for b in gpt_summary["Sequence"])
         })
+    if af_result:
+        tab2.append({"type": "markdown", "data": (
+            "### AlphaFold Confidence (pLDDT)\n"
+            f"- **Entry:** {af_result['entry_id']}\n"
+            f"- **Mean pLDDT:** {af_result['plddt_mean']} "
+            f"(min {af_result['plddt_min']}, max {af_result['plddt_max']})\n"
+            "_pLDDT > 90: very high confidence · 70–90: high · 50–70: low · < 50: very low_"
+        )})
     if not tab2:
         tab2.append({"type": "markdown", "data": "_No UniProt domain annotations found._"})
 
@@ -374,6 +418,11 @@ def _parse_analyze_request(text: str) -> str | None:
 def _parse_foldseek_request(text: str) -> str | None:
     """Return the PDB ID if the message is a Foldseek search request, else None."""
     m = _FOLDSEEK_RE.match(text)
+    return m.group(1).upper() if m else None
+
+def _parse_alphafold_request(text: str) -> str | None:
+    """Return the UniProt ID if the message is an AlphaFold fetch request, else None."""
+    m = _ALPHAFOLD_RE.match(text)
     return m.group(1).upper() if m else None
 
 def _is_hpc_command(text: str) -> bool:
@@ -471,6 +520,7 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
 
     pdb_id        = _parse_analyze_request(prompt)
     foldseek_id   = _parse_foldseek_request(prompt)
+    alphafold_id  = _parse_alphafold_request(prompt)
 
     # Route: HPC command (checked first — unambiguous prefix match)
     if _is_hpc_command(prompt):
@@ -481,6 +531,40 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
             st.markdown(response)
             st.session_state.messages.append({"role": "assistant", "content": hpc_output})
             st.session_state.chat_display.append({"role": "assistant", "content": response})
+
+    # Route: AlphaFold structure fetch
+    elif alphafold_id:
+        with st.chat_message("assistant"):
+            with st.spinner(f"Fetching AlphaFold structure for {alphafold_id}…"):
+                try:
+                    af = alphafold_fetch(alphafold_id)
+                    response = (
+                        f"### AlphaFold Structure — {alphafold_id}\n"
+                        f"- **Entry:** {af['entry_id']}\n"
+                        f"- **Gene:** {af['gene']} | **Organism:** {af['organism']}\n"
+                        f"- **Description:** {af['description']}\n"
+                        f"- **Mean pLDDT:** {af['plddt_mean']} "
+                        f"(min {af['plddt_min']}, max {af['plddt_max']})\n\n"
+                        "_pLDDT > 90: very high · 70–90: high · 50–70: low · < 50: very low_"
+                    )
+                    viewer_html = build_3dmol_html(alphafold_id, pdb_path=af["pdb_path"])
+                    artifacts = [
+                        {"type": "markdown", "data": response},
+                        {"type": "markdown", "data": "### 3D Structure Viewer"},
+                        {"type": "html",     "data": viewer_html},
+                    ]
+                    st.markdown(response)
+                    _render_artifact(artifacts[1])
+                    _render_artifact(artifacts[2])
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    st.session_state.chat_display.append({
+                        "role": "assistant", "content": "", "artifacts": artifacts,
+                    })
+                except Exception as e:
+                    err = f"AlphaFold fetch failed: {e}"
+                    st.error(err)
+                    st.session_state.messages.append({"role": "assistant", "content": err})
+                    st.session_state.chat_display.append({"role": "assistant", "content": err})
 
     # Route: Foldseek structural similarity search
     elif foldseek_id:

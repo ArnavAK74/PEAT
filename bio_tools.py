@@ -2,6 +2,7 @@
 import os
 import time
 import requests
+import statistics
 
 _FOLDSEEK_URL = "https://search.foldseek.com/api"
 _CACHE_DIR    = "/tmp/peat_structures"
@@ -15,7 +16,6 @@ def foldseek_search(pdb_id: str) -> list[dict]:
       1. Cache PDB file in /tmp/peat_structures/, downloading from RCSB if absent.
       2. Submit to Foldseek against pdb100 + afdb50 databases.
       3. Poll the ticket endpoint until results are ready.
-      4. Return a dict with:
       4. Return top 10 hits sorted by TM-score (descending) as a list of dicts
          with keys: pdb_id, evalue, tm_score, sequence_identity, description.
     """
@@ -81,3 +81,83 @@ def foldseek_search(pdb_id: str) -> list[dict]:
 
     hits.sort(key=lambda h: h["tm_score"] or 0.0, reverse=True)
     return hits[:10]
+
+
+_ALPHAFOLD_URL = "https://alphafold.ebi.ac.uk/api/prediction"
+
+
+def alphafold_fetch(uniprot_id: str) -> dict:
+    """
+    Fetch the AlphaFold structure for a UniProt ID.
+
+    Steps:
+      1. Call https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}.
+      2. Download the PDB file to /tmp/peat_structures/AF-{uniprot_id}.pdb
+         (cached — skips download if already present).
+      3. Parse per-residue pLDDT confidence scores from the B-factor column.
+      4. Return a dict with keys:
+           pdb_path    — local path to the downloaded PDB file
+           plddt_mean  — mean pLDDT across all residues
+           plddt_min   — minimum pLDDT
+           plddt_max   — maximum pLDDT
+           entry_id    — AlphaFold entry ID (e.g. AF-Q9WYE2-F1)
+           gene        — gene name from AlphaFold metadata
+           organism    — organism scientific name
+           description — UniProt protein description
+    """
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+
+    # ── 1. Fetch metadata ────────────────────────────────────────────────────────
+    resp = requests.get(f"{_ALPHAFOLD_URL}/{uniprot_id}", timeout=15)
+    resp.raise_for_status()
+    entries = resp.json()
+    if not entries:
+        raise ValueError(f"No AlphaFold entry found for UniProt ID: {uniprot_id}")
+    entry = entries[0]
+
+    pdb_url  = entry.get("pdbUrl", "")
+    if not pdb_url:
+        raise ValueError(f"No pdbUrl in AlphaFold response for {uniprot_id}")
+
+    # ── 2. Cache / download PDB ──────────────────────────────────────────────────
+    pdb_path = os.path.join(_CACHE_DIR, f"AF-{uniprot_id}.pdb")
+    if not os.path.exists(pdb_path):
+        dl = requests.get(pdb_url, timeout=30)
+        dl.raise_for_status()
+        with open(pdb_path, "wb") as fh:
+            fh.write(dl.content)
+        pdb_content = dl.text
+    else:
+        with open(pdb_path) as fh:
+            pdb_content = fh.read()
+
+    # ── 3. Parse pLDDT from B-factor column (cols 60-66 of ATOM records) ────────
+    plddt_scores = []
+    seen_residues = set()
+    for line in pdb_content.splitlines():
+        if line.startswith("ATOM"):
+            # Use only CA atoms to get one score per residue
+            atom_name  = line[12:16].strip()
+            chain      = line[21]
+            res_seq    = line[22:26].strip()
+            if atom_name == "CA":
+                try:
+                    plddt_scores.append(float(line[60:66]))
+                    seen_residues.add((chain, res_seq))
+                except ValueError:
+                    pass
+
+    plddt_mean = round(statistics.mean(plddt_scores), 2) if plddt_scores else None
+    plddt_min  = round(min(plddt_scores), 2)             if plddt_scores else None
+    plddt_max  = round(max(plddt_scores), 2)             if plddt_scores else None
+
+    return {
+        "pdb_path":    pdb_path,
+        "plddt_mean":  plddt_mean,
+        "plddt_min":   plddt_min,
+        "plddt_max":   plddt_max,
+        "entry_id":    entry.get("entryId", ""),
+        "gene":        entry.get("gene", ""),
+        "organism":    entry.get("organismScientificName", ""),
+        "description": entry.get("uniprotDescription", ""),
+    }
