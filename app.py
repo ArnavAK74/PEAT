@@ -487,11 +487,7 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
         with st.chat_message("assistant"):
             with st.spinner(f"Running Foldseek search for {foldseek_id}…"):
                 try:
-                    result  = foldseek_search(foldseek_id)
-                    hits    = result["hits"]
-                    raw     = result["raw"]
-                    raw_json = json.dumps(raw, indent=2)
-
+                    hits = foldseek_search(foldseek_id)
                     if hits:
                         rows = ["| # | PDB/AF ID | TM-score | E-value | Seq. Identity | Description |",
                                 "|---|-----------|----------|---------|---------------|-------------|"]
@@ -505,17 +501,11 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
                     else:
                         response = f"Foldseek returned no hits for {foldseek_id}."
 
-                    artifacts = [
-                        {"type": "markdown", "data": response},
-                        {"type": "expander", "label": "Raw Foldseek API response", "expanded": not hits,
-                         "content": [{"type": "code", "data": raw_json, "language": "json"}]},
-                    ]
+                    artifact = {"type": "markdown", "data": response}
                     st.markdown(response)
-                    for a in artifacts:
-                        _render_artifact(a)
                     st.session_state.messages.append({"role": "assistant", "content": response})
                     st.session_state.chat_display.append({
-                        "role": "assistant", "content": "", "artifacts": artifacts,
+                        "role": "assistant", "content": "", "artifacts": [artifact],
                     })
                 except Exception as e:
                     err = f"Foldseek search failed: {e}"

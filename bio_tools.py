@@ -7,7 +7,7 @@ _FOLDSEEK_URL = "https://search.foldseek.com/api"
 _CACHE_DIR    = "/tmp/peat_structures"
 
 
-def foldseek_search(pdb_id: str) -> dict:
+def foldseek_search(pdb_id: str) -> list[dict]:
     """
     Search for structurally similar proteins using the Foldseek REST API.
 
@@ -16,9 +16,8 @@ def foldseek_search(pdb_id: str) -> dict:
       2. Submit to Foldseek against pdb100 + afdb50 databases.
       3. Poll the ticket endpoint until results are ready.
       4. Return a dict with:
-           hits  — top 10 hits sorted by TM-score (descending), each with keys:
-                   pdb_id, evalue, tm_score, sequence_identity, description
-           raw   — full API response payload for debugging
+      4. Return top 10 hits sorted by TM-score (descending) as a list of dicts
+         with keys: pdb_id, evalue, tm_score, sequence_identity, description.
     """
     pdb_id = pdb_id.upper()
     os.makedirs(_CACHE_DIR, exist_ok=True)
@@ -81,4 +80,4 @@ def foldseek_search(pdb_id: str) -> dict:
                 })
 
     hits.sort(key=lambda h: h["tm_score"] or 0.0, reverse=True)
-    return {"hits": hits[:10], "raw": data}
+    return hits[:10]
