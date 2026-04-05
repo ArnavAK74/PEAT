@@ -74,8 +74,8 @@ def foldseek_search(pdb_id: str) -> dict:
             for hit in query_alignments:
                 hits.append({
                     "pdb_id":            hit.get("target", ""),
-                    "evalue":            hit.get("evalue"),
-                    "tm_score":          hit.get("alntmscore"),
+                    "evalue":            hit.get("eval"),
+                    "tm_score":          hit.get("score"),
                     "sequence_identity": hit.get("seqId"),
                     "description":       hit.get("taxName") or hit.get("description", ""),
                 })
