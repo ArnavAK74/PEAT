@@ -160,6 +160,10 @@ def _render_artifact(artifact: dict) -> None:
                     st.success(f"Predicted ΔΔG: {result.get('ddg')} kCal/mol")
                 except Exception as e:
                     st.error(f"Error: {e}")
+    elif t == "expander":
+        with st.expander(artifact["label"], expanded=artifact.get("expanded", False)):
+            for sub in artifact["content"]:
+                _render_artifact(sub)
     elif t == "tabs":
         tab_labels = [tab["label"] for tab in artifact["tabs"]]
         tab_objs   = st.tabs(tab_labels)
@@ -483,24 +487,35 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
         with st.chat_message("assistant"):
             with st.spinner(f"Running Foldseek search for {foldseek_id}…"):
                 try:
-                    hits = foldseek_search(foldseek_id)
+                    result  = foldseek_search(foldseek_id)
+                    hits    = result["hits"]
+                    raw     = result["raw"]
+                    raw_json = json.dumps(raw, indent=2)
+
                     if hits:
                         rows = ["| # | PDB/AF ID | TM-score | E-value | Seq. Identity | Description |",
                                 "|---|-----------|----------|---------|---------------|-------------|"]
                         for i, h in enumerate(hits, 1):
-                            tm   = f"{h['tm_score']:.3f}"   if h["tm_score"]            is not None else "—"
-                            ev   = f"{h['evalue']:.2e}"     if h["evalue"]              is not None else "—"
+                            tm   = f"{h['tm_score']:.3f}"        if h["tm_score"]            is not None else "—"
+                            ev   = f"{h['evalue']:.2e}"          if h["evalue"]              is not None else "—"
                             sid  = f"{h['sequence_identity']:.1%}" if h["sequence_identity"] is not None else "—"
                             rows.append(f"| {i} | `{h['pdb_id']}` | {tm} | {ev} | {sid} | {h['description']} |")
                         table_md = "\n".join(rows)
                         response = f"### Foldseek — Top hits for {foldseek_id}\n\n{table_md}"
                     else:
                         response = f"Foldseek returned no hits for {foldseek_id}."
-                    artifact = {"type": "markdown", "data": response}
+
+                    artifacts = [
+                        {"type": "markdown", "data": response},
+                        {"type": "expander", "label": "Raw Foldseek API response", "expanded": not hits,
+                         "content": [{"type": "code", "data": raw_json, "language": "json"}]},
+                    ]
                     st.markdown(response)
+                    for a in artifacts:
+                        _render_artifact(a)
                     st.session_state.messages.append({"role": "assistant", "content": response})
                     st.session_state.chat_display.append({
-                        "role": "assistant", "content": "", "artifacts": [artifact],
+                        "role": "assistant", "content": "", "artifacts": artifacts,
                     })
                 except Exception as e:
                     err = f"Foldseek search failed: {e}"
