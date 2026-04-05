@@ -76,7 +76,7 @@ def foldseek_search(pdb_id: str) -> dict:
                     "pdb_id":            hit.get("target", ""),
                     "evalue":            hit.get("eval"),
                     "tm_score":          hit.get("score"),
-                    "sequence_identity": hit.get("seqId"),
+                    "sequence_identity": (hit["seqId"] / 100) if hit.get("seqId") is not None else None,
                     "description":       hit.get("taxName") or hit.get("description", ""),
                 })
 
