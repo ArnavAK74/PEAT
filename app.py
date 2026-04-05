@@ -21,6 +21,7 @@ from sequence_tools import conservation_scores, run_blast
 from predictors import predict_ddg_dynamut
 from ui import plot_domains, plot_conservation
 from hpc_tools import run_hpc_command
+from bio_tools import foldseek_search
 
 # ── LLM client ─────────────────────────────────────────────────────────────────
 _api_key  = os.getenv("OPENROUTER_API_KEY", "")
@@ -41,6 +42,19 @@ _HPC_PREFIXES = {
     "squeue", "sacct", "sbatch", "scancel",
     "echo", "ls", "cat", "head", "tail",
 }
+# Matches messages whose intent is to run a Foldseek search:
+#   "foldseek 6B5X" | "similar structures 6B5X" | "find similar to 6B5X"
+_FOLDSEEK_RE = re.compile(
+    r'^\s*'
+    r'(?:foldseek|find\s+similar(?:\s+structures?)?(?:\s+to)?'
+    r'|similar\s+structures?(?:\s+to)?'
+    r'|structure\s+search(?:\s+for)?)\s+'
+    r'(?:pdb\s+)?'
+    r'([0-9][A-Za-z0-9]{3})'
+    r'\s*$',
+    re.IGNORECASE,
+)
+
 # Matches messages whose *intent* is to analyze a PDB ID:
 #   "6B5X" | "analyze 6B5X" | "fetch pdb 6B5X" | "look up 6B5X"
 # Does NOT match PDB IDs embedded in longer questions.
@@ -353,6 +367,11 @@ def _parse_analyze_request(text: str) -> str | None:
     m = _ANALYZE_RE.match(text)
     return m.group(1).upper() if m else None
 
+def _parse_foldseek_request(text: str) -> str | None:
+    """Return the PDB ID if the message is a Foldseek search request, else None."""
+    m = _FOLDSEEK_RE.match(text)
+    return m.group(1).upper() if m else None
+
 def _is_hpc_command(text: str) -> bool:
     parts = text.strip().split()
     return bool(parts) and parts[0].lower() in _HPC_PREFIXES
@@ -446,7 +465,8 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    pdb_id = _parse_analyze_request(prompt)
+    pdb_id        = _parse_analyze_request(prompt)
+    foldseek_id   = _parse_foldseek_request(prompt)
 
     # Route: HPC command (checked first — unambiguous prefix match)
     if _is_hpc_command(prompt):
@@ -457,6 +477,36 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
             st.markdown(response)
             st.session_state.messages.append({"role": "assistant", "content": hpc_output})
             st.session_state.chat_display.append({"role": "assistant", "content": response})
+
+    # Route: Foldseek structural similarity search
+    elif foldseek_id:
+        with st.chat_message("assistant"):
+            with st.spinner(f"Running Foldseek search for {foldseek_id}…"):
+                try:
+                    hits = foldseek_search(foldseek_id)
+                    if hits:
+                        rows = ["| # | PDB/AF ID | TM-score | E-value | Seq. Identity | Description |",
+                                "|---|-----------|----------|---------|---------------|-------------|"]
+                        for i, h in enumerate(hits, 1):
+                            tm   = f"{h['tm_score']:.3f}"   if h["tm_score"]            is not None else "—"
+                            ev   = f"{h['evalue']:.2e}"     if h["evalue"]              is not None else "—"
+                            sid  = f"{h['sequence_identity']:.1%}" if h["sequence_identity"] is not None else "—"
+                            rows.append(f"| {i} | `{h['pdb_id']}` | {tm} | {ev} | {sid} | {h['description']} |")
+                        table_md = "\n".join(rows)
+                        response = f"### Foldseek — Top hits for {foldseek_id}\n\n{table_md}"
+                    else:
+                        response = f"Foldseek returned no hits for {foldseek_id}."
+                    artifact = {"type": "markdown", "data": response}
+                    st.markdown(response)
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    st.session_state.chat_display.append({
+                        "role": "assistant", "content": "", "artifacts": [artifact],
+                    })
+                except Exception as e:
+                    err = f"Foldseek search failed: {e}"
+                    st.error(err)
+                    st.session_state.messages.append({"role": "assistant", "content": err})
+                    st.session_state.chat_display.append({"role": "assistant", "content": err})
 
     # Route: new protein analysis
     elif pdb_id and pdb_id not in st.session_state.analyzed_pdb_ids:
