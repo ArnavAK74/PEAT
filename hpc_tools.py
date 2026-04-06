@@ -36,6 +36,8 @@ _HPC_HOST       = os.getenv("HPC_HOST", "")
 _HPC_USER       = os.getenv("HPC_USER", "")
 _HPC_WORKDIR    = os.getenv("HPC_WORKDIR", "~/peat_runs")
 _HPC_PARTITION  = os.getenv("HPC_PARTITION", "shared")        # Anvil default
+_HPC_QOS        = os.getenv("HPC_QOS", "shared")              # Anvil requires this
+_HPC_ACCOUNT    = os.getenv("HPC_ACCOUNT", "")                # allocation name (required on Anvil)
 _GROMACS_MODULE = os.getenv("GROMACS_MODULE", "gromacs/2024.1")
 
 
@@ -187,6 +189,8 @@ pbc             = no
 
 
 def _slurm_script(pdb_id: str, remote_dir: str) -> str:
+    account_line = f"#SBATCH --account={_HPC_ACCOUNT}\n" if _HPC_ACCOUNT else ""
+    qos_line     = f"#SBATCH --qos={_HPC_QOS}\n"        if _HPC_QOS     else ""
     return f"""\
 #!/bin/bash
 #SBATCH --job-name=peat_{pdb_id}_em
@@ -196,6 +200,7 @@ def _slurm_script(pdb_id: str, remote_dir: str) -> str:
 #SBATCH --cpus-per-task=4
 #SBATCH --time=00:30:00
 #SBATCH --partition={_HPC_PARTITION}
+{qos_line}{account_line}
 
 set -e
 cd {remote_dir}
