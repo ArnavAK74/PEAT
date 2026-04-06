@@ -616,13 +616,13 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
                 try:
                     hits = foldseek_search(foldseek_id)
                     if hits:
-                        rows = ["| # | PDB/AF ID | TM-score | E-value | Seq. Identity | Description |",
-                                "|---|-----------|----------|---------|---------------|-------------|"]
+                        rows = ["| # | PDB/AF ID | Probability | E-value | Seq. Identity | Description |",
+                                "|---|-----------|-------------|---------|---------------|-------------|"]
                         for i, h in enumerate(hits, 1):
-                            tm   = f"{h['tm_score']:.3f}"        if h["tm_score"]            is not None else "—"
-                            ev   = f"{h['evalue']:.2e}"          if h["evalue"]              is not None else "—"
-                            sid  = f"{h['sequence_identity']:.1%}" if h["sequence_identity"] is not None else "—"
-                            rows.append(f"| {i} | `{h['pdb_id']}` | {tm} | {ev} | {sid} | {h['description']} |")
+                            prob = f"{h['prob']:.3f}"              if h["prob"]               is not None else "—"
+                            ev   = f"{h['evalue']:.2e}"            if h["evalue"]             is not None else "—"
+                            sid  = f"{h['sequence_identity']:.1%}" if h["sequence_identity"]  is not None else "—"
+                            rows.append(f"| {i} | `{h['pdb_id']}` | {prob} | {ev} | {sid} | {h['description']} |")
                         table_md = "\n".join(rows)
                         response = f"### Foldseek — Top hits for {foldseek_id}\n\n{table_md}"
                     else:

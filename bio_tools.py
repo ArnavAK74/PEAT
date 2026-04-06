@@ -74,12 +74,12 @@ def foldseek_search(pdb_id: str) -> list[dict]:
                 hits.append({
                     "pdb_id":            hit.get("target", ""),
                     "evalue":            hit.get("eval"),
-                    "tm_score":          hit.get("score"),
+                    "prob":              hit.get("prob"),   # probability of true homology, 0-1
                     "sequence_identity": (hit["seqId"] / 100) if hit.get("seqId") is not None else None,
                     "description":       hit.get("taxName") or hit.get("description", ""),
                 })
 
-    hits.sort(key=lambda h: h["tm_score"] or 0.0, reverse=True)
+    hits.sort(key=lambda h: h["prob"] or 0.0, reverse=True)
     return hits[:10]
 
 
