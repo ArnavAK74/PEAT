@@ -231,36 +231,61 @@ def _run_analysis(pdb_id: str, user_question: str) -> tuple[str, list]:
             )
 
     # UniProt annotation summary via LLM
+    # Build context from UniProt comments when available; fall back to PDB
+    # metadata + UniProt features for unreviewed/sparse entries.
     gpt_summary = {}
-    if up_features.get("comments"):
-        all_texts = []
-        for comment in up_features["comments"]:
-            if comment.get("texts"):
-                for text in comment["texts"]:
-                    all_texts.append(text.get("value", ""))
-            elif comment.get("commentType") == "CATALYTIC ACTIVITY":
-                reaction = comment.get("reaction", {}).get("name", "")
-                ec_num   = comment.get("reaction", {}).get("ecNumber", "")
-                if reaction:
-                    all_texts.append(f"Catalytic Activity: {reaction} (EC {ec_num})")
-            elif comment.get("commentType") == "SUBCELLULAR LOCATION":
-                for loc in comment.get("subcellularLocations", []):
-                    val = loc.get("location", {}).get("value", "")
-                    if val:
-                        all_texts.append(f"Subcellular Location: {val}")
-            elif comment.get("commentType") == "INTERACTION":
-                for interaction in comment.get("interactions", []):
-                    g1    = interaction.get("interactantOne", {}).get("geneName", "")
-                    g2    = interaction.get("interactantTwo", {}).get("geneName", "")
-                    count = interaction.get("numberOfExperiments", 0)
-                    all_texts.append(f"Interaction: {g1} ↔ {g2} ({count} experiments)")
+    all_texts = []
 
-        prompt = f"""You're an expert assistant for structural biologists.
+    for comment in up_features.get("comments", []):
+        if comment.get("texts"):
+            for text in comment["texts"]:
+                all_texts.append(text.get("value", ""))
+        elif comment.get("commentType") == "CATALYTIC ACTIVITY":
+            reaction = comment.get("reaction", {}).get("name", "")
+            ec_num   = comment.get("reaction", {}).get("ecNumber", "")
+            if reaction:
+                all_texts.append(f"Catalytic Activity: {reaction} (EC {ec_num})")
+        elif comment.get("commentType") == "SUBCELLULAR LOCATION":
+            for loc in comment.get("subcellularLocations", []):
+                val = loc.get("location", {}).get("value", "")
+                if val:
+                    all_texts.append(f"Subcellular Location: {val}")
+        elif comment.get("commentType") == "INTERACTION":
+            for interaction in comment.get("interactions", []):
+                g1    = interaction.get("interactantOne", {}).get("geneName", "")
+                g2    = interaction.get("interactantTwo", {}).get("geneName", "")
+                count = interaction.get("numberOfExperiments", 0)
+                all_texts.append(f"Interaction: {g1} ↔ {g2} ({count} experiments)")
 
-Summarize the following UniProt annotations into three categories:
+    # Fallback: supplement with PDB struct metadata and UniProt domain features
+    # when UniProt comments are absent (common for unreviewed TrEMBL entries)
+    if not all_texts:
+        print(f"[{pdb_id}] No UniProt comments for {uniprot_id} — using PDB metadata as fallback")
+        struct_title    = entry.get("struct", {}).get("title", "")
+        struct_keywords = entry.get("struct_keywords", {}).get("text", "")
+        paper_title     = title if title != "N/A" else ""
+        if struct_title:
+            all_texts.append(f"PDB structure title: {struct_title}")
+        if struct_keywords:
+            all_texts.append(f"PDB keywords: {struct_keywords}")
+        if paper_title:
+            all_texts.append(f"Associated paper: {paper_title}")
+        for feat in up_features.get("features", []):
+            feat_type = feat.get("type", "")
+            feat_desc = feat.get("description", "")
+            loc       = feat.get("location", {})
+            start     = loc.get("start", {}).get("value", "")
+            end       = loc.get("end", {}).get("value", "")
+            if feat_type and (feat_desc or feat_type != "Chain"):
+                all_texts.append(f"{feat_type}: {feat_desc} (residues {start}–{end})")
+
+    if all_texts:
+        annot_prompt = f"""You're an expert assistant for structural biologists.
+
+Summarize the following protein annotations into three categories:
 - Structure (domains, motifs, folding)
 - Function (enzymatic activity, pathways)
-- Sequence features (PTMs, polymorphisms, isoforms)
+- Sequence features (PTMs, polymorphisms, isoforms, signal peptides)
 
 Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each value is a list of bullet-point strings.
 
@@ -270,7 +295,7 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
         try:
             resp = client.chat.completions.create(
                 model=_model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": annot_prompt}],
                 temperature=0.3,
                 max_tokens=1000,
             )
@@ -310,10 +335,43 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
             except Exception:
                 lit_answer = None
 
+        # Fallback: no PDF accessible — answer from UniProt + PDB metadata alone
+        if not paper_text and user_question:
+            fallback_context_parts = [
+                f"PDB ID: {pdb_id}",
+                f"Paper title: {title}" if title != "N/A" else "",
+                f"Journal: {journal}" if journal != "N/A" else "",
+                f"DOI: {doi}",
+            ]
+            fallback_context_parts += all_texts  # UniProt comments or PDB metadata built above
+            fallback_context = "\n".join(p for p in fallback_context_parts if p)
+            fallback_prompt = (
+                f"You are an expert research assistant for protein engineers and biochemists.\n"
+                f"The full text of the paper (DOI: {doi}) could not be retrieved. "
+                f"Answer the following question using only the metadata and annotations provided below. "
+                f"Clearly note at the end of your answer that the full paper was not accessible and "
+                f"your answer is based on available annotations only.\n\n"
+                f"Question: {user_question}\n"
+                f"---\nAvailable context:\n{fallback_context}\n---\nAnswer:"
+            )
+            try:
+                lit_answer = client.chat.completions.create(
+                    model=_model,
+                    messages=[{"role": "user", "content": fallback_prompt}],
+                    temperature=0.3,
+                    max_tokens=1000,
+                ).choices[0].message.content
+            except Exception:
+                lit_answer = None
+
     # Protein identity fields
     prot_desc = up_features.get("proteinDescription", {})
     rec_name  = prot_desc.get("recommendedName", {})
-    name = rec_name.get("fullName", {}).get("value", "N/A")
+    name = rec_name.get("fullName", {}).get("value", "")
+    if not name:
+        # Unreviewed TrEMBL entries use submissionNames instead of recommendedName
+        sub_names = prot_desc.get("submissionNames", [])
+        name = (sub_names[0].get("fullName", {}).get("value", "") if sub_names else "") or "N/A"
     ec   = (rec_name.get("ecNumbers", [{}]) or [{}])[0].get("value", "N/A")
     gene = (
         up_features.get("genes", [{}])[0].get("geneName", {}).get("value", "N/A")
