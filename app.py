@@ -429,23 +429,41 @@ def _is_hpc_command(text: str) -> bool:
     return bool(parts) and parts[0].lower() in _HPC_PREFIXES
 
 _AA_CHARS     = set("ACDEFGHIKLMNPQRSTVWY")
-_AA_THRESHOLD = 0.85   # fraction of non-whitespace chars that must be valid AAs
-_MIN_SEQ_LEN  = 20     # ignore anything shorter (avoids false positives on short words)
+_AA_THRESHOLD = 0.80   # fraction of characters that must be valid AAs
+_MIN_SEQ_LEN  = 20     # ignore anything shorter
 
 def _parse_sequence_input(text: str) -> str | None:
     """
     Return the cleaned amino acid sequence if the message is a FASTA block or a
     raw AA sequence; else None.
 
-    Handles:
-    - FASTA format: strips all header lines starting with '>'
-    - Raw sequence: accepts if >= 85% of characters are standard amino acids
-      and the sequence is at least 20 residues long
+    Rules (strict to avoid misrouting plain English):
+    - FASTA: message must contain at least one line starting with '>'.
+      Header lines are stripped; the remaining sequence is validated.
+    - Raw sequence: the entire message must contain NO spaces or tabs
+      (English sentences always have spaces; protein sequences do not),
+      and >= 80% of characters must be standard amino acids.
+    Plain English questions are never matched by either path.
     """
-    lines = text.strip().splitlines()
-    seq_lines = [l for l in lines if not l.startswith(">")]
-    seq = "".join(seq_lines).replace(" ", "").upper()
+    stripped = text.strip()
+    lines    = stripped.splitlines()
 
+    # ── FASTA path: requires an explicit '>' header ──────────────────────────
+    if any(l.startswith(">") for l in lines):
+        seq_lines = [l.strip() for l in lines if not l.startswith(">")]
+        seq = "".join(seq_lines).upper()
+        if len(seq) < _MIN_SEQ_LEN:
+            return None
+        valid = sum(1 for c in seq if c in _AA_CHARS)
+        if valid / len(seq) >= _AA_THRESHOLD:
+            return seq
+        return None
+
+    # ── Raw sequence path: no spaces allowed ─────────────────────────────────
+    if " " in stripped or "\t" in stripped:
+        return None   # English sentences always have spaces — bail out early
+
+    seq = stripped.upper()
     if len(seq) < _MIN_SEQ_LEN:
         return None
     valid = sum(1 for c in seq if c in _AA_CHARS)
