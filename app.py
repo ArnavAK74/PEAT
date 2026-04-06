@@ -293,7 +293,10 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
         if paper_text and user_question:
             qa_prompt = (
                 f"You are an expert research assistant for protein engineers and biochemists.\n"
-                f"Use the paper (DOI: {doi}) to answer the following question.\n\n"
+                f"Use the paper (DOI: {doi}) to answer the following question.\n"
+                f"The paper may describe the protein family or close homologs rather than this exact protein — "
+                f"use any relevant context about the protein family, catalytic mechanism, conserved residues, "
+                f"or structural class to give the best possible answer.\n\n"
                 f"Question: {user_question}\n"
                 f"---\nPaper Excerpt (first 10 000 chars):\n{paper_text}\n---\nAnswer:"
             )
@@ -689,7 +692,10 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
             else:
                 with st.spinner(f"Analyzing {found_id}…"):
                     try:
-                        text_summary, artifacts = _run_analysis(found_id, prompt)
+                        text_summary, artifacts = _run_analysis(
+                            found_id,
+                            "What is the function and mechanism of this protein?",
+                        )
                         st.markdown(text_summary)
                         for artifact in artifacts:
                             _render_artifact(artifact)
