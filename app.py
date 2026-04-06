@@ -400,10 +400,10 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
             f"(min {af_result['plddt_min']}, max {af_result['plddt_max']})\n"
         )
     if gpt_summary.get("Function"):
-        text_summary += "**Functional notes:**\n" + "\n".join(f"- {b}" for b in gpt_summary["Function"]) + "\n"
+        text_summary += "\n**Functional notes:**\n" + "\n".join(f"- {b}" for b in gpt_summary["Function"]) + "\n"
     if lit_answer:
         label = "Annotation-based answer" if lit_answer_is_fallback else "Literature answer"
-        text_summary += f"**{label}:** {lit_answer[:400]}…\n"
+        text_summary += f"\n**{label}:**\n{lit_answer[:400]}…\n"
 
     # ── Artifacts ──────────────────────────────────────────────────────────────
     # Tab 1: Literature & Catalysis
