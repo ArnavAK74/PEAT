@@ -57,13 +57,10 @@ _ALPHAFOLD_RE = re.compile(
 # Matches messages whose intent is to run a Foldseek search:
 #   "foldseek 6B5X" | "similar structures 6B5X" | "find similar to 6B5X"
 _FOLDSEEK_RE = re.compile(
-    r'^\s*'
-    r'(?:foldseek|find\s+similar(?:\s+structures?)?(?:\s+to)?'
+    r'(?:^|.*\b)foldseek\b.*?(?:on|for|against|search)?\s+(?:pdb\s+)?([0-9][A-Za-z0-9]{3})\b'
+    r'|(?:find\s+similar(?:\s+structures?)?(?:\s+to)?'
     r'|similar\s+structures?(?:\s+to)?'
-    r'|structure\s+search(?:\s+for)?)\s+'
-    r'(?:pdb\s+)?'
-    r'([0-9][A-Za-z0-9]{3})'
-    r'\s*$',
+    r'|structure\s+search(?:\s+for)?)\s+(?:pdb\s+)?([0-9][A-Za-z0-9]{3})\b',
     re.IGNORECASE,
 )
 
@@ -417,8 +414,10 @@ def _parse_analyze_request(text: str) -> str | None:
 
 def _parse_foldseek_request(text: str) -> str | None:
     """Return the PDB ID if the message is a Foldseek search request, else None."""
-    m = _FOLDSEEK_RE.match(text)
-    return m.group(1).upper() if m else None
+    m = _FOLDSEEK_RE.search(text)
+    if not m:
+        return None
+    return (m.group(1) or m.group(2)).upper()
 
 def _parse_alphafold_request(text: str) -> str | None:
     """Return the UniProt ID if the message is an AlphaFold fetch request, else None."""
