@@ -239,6 +239,7 @@ echo "[PEAT] mdrun"
 gmx mdrun \\
     -v -deffnm em \\
     -ntmpi 1 -ntomp 4 \\
+    -gpu_id 0 -nb gpu -bonded cpu \\
     -nobackup 2>&1
 
 echo "[PEAT] done"
