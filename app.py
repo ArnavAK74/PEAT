@@ -311,58 +311,66 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
             gpt_summary = {}
 
     # Literature Q&A
-    lit_answer  = None
-    paper_text  = None
+    lit_answer            = None
+    lit_answer_is_fallback = False
+    paper_text            = None
+
     if doi != "N/A":
         paper_text = _fetch_paper_text(doi, EMAIL)
-        if paper_text and user_question:
-            qa_prompt = (
-                f"You are an expert research assistant for protein engineers and biochemists.\n"
-                f"Use the paper (DOI: {doi}) to answer the following question.\n"
-                f"The paper may describe the protein family or close homologs rather than this exact protein — "
-                f"use any relevant context about the protein family, catalytic mechanism, conserved residues, "
-                f"or structural class to give the best possible answer.\n\n"
-                f"Question: {user_question}\n"
-                f"---\nPaper Excerpt (first 10 000 chars):\n{paper_text}\n---\nAnswer:"
-            )
-            try:
-                lit_answer = client.chat.completions.create(
-                    model=_model,
-                    messages=[{"role": "user", "content": qa_prompt}],
-                    temperature=0.3,
-                    max_tokens=1000,
-                ).choices[0].message.content
-            except Exception:
-                lit_answer = None
 
-        # Fallback: no PDF accessible — answer from UniProt + PDB metadata alone
-        if not paper_text and user_question:
-            fallback_context_parts = [
-                f"PDB ID: {pdb_id}",
-                f"Paper title: {title}" if title != "N/A" else "",
-                f"Journal: {journal}" if journal != "N/A" else "",
-                f"DOI: {doi}",
-            ]
-            fallback_context_parts += all_texts  # UniProt comments or PDB metadata built above
-            fallback_context = "\n".join(p for p in fallback_context_parts if p)
-            fallback_prompt = (
-                f"You are an expert research assistant for protein engineers and biochemists.\n"
-                f"The full text of the paper (DOI: {doi}) could not be retrieved. "
-                f"Answer the following question using only the metadata and annotations provided below. "
-                f"Clearly note at the end of your answer that the full paper was not accessible and "
-                f"your answer is based on available annotations only.\n\n"
-                f"Question: {user_question}\n"
-                f"---\nAvailable context:\n{fallback_context}\n---\nAnswer:"
-            )
-            try:
-                lit_answer = client.chat.completions.create(
-                    model=_model,
-                    messages=[{"role": "user", "content": fallback_prompt}],
-                    temperature=0.3,
-                    max_tokens=1000,
-                ).choices[0].message.content
-            except Exception:
-                lit_answer = None
+    if paper_text and user_question:
+        qa_prompt = (
+            f"You are an expert research assistant for protein engineers and biochemists.\n"
+            f"Use the paper (DOI: {doi}) to answer the following question.\n"
+            f"The paper may describe the protein family or close homologs rather than this exact protein — "
+            f"use any relevant context about the protein family, catalytic mechanism, conserved residues, "
+            f"or structural class to give the best possible answer.\n\n"
+            f"Question: {user_question}\n"
+            f"---\nPaper Excerpt (first 10 000 chars):\n{paper_text}\n---\nAnswer:"
+        )
+        try:
+            lit_answer = client.chat.completions.create(
+                model=_model,
+                messages=[{"role": "user", "content": qa_prompt}],
+                temperature=0.3,
+                max_tokens=1000,
+            ).choices[0].message.content
+        except Exception:
+            lit_answer = None
+
+    # Fallback: always run when no PDF was retrieved, using PDB + UniProt context
+    if not lit_answer:
+        lit_answer_is_fallback = True
+        fallback_context_parts = [
+            f"PDB ID: {pdb_id}",
+            f"Paper title: {title}" if title != "N/A" else "",
+            f"Journal: {journal}"   if journal != "N/A" else "",
+            f"DOI: {doi}"           if doi != "N/A" else "",
+        ]
+        fallback_context_parts += all_texts  # populated from UniProt comments or PDB metadata
+        fallback_context = "\n".join(p for p in fallback_context_parts if p)
+        paper_note = (
+            "The full text of the associated paper could not be retrieved. "
+            if doi != "N/A" else
+            "No associated paper DOI is available. "
+        )
+        fallback_prompt = (
+            f"You are an expert research assistant for protein engineers and biochemists.\n"
+            f"{paper_note}"
+            f"Answer the following question using only the metadata and annotations provided below. "
+            f"Clearly note at the end that your answer is based on available annotations only.\n\n"
+            f"Question: {user_question}\n"
+            f"---\nAvailable context:\n{fallback_context}\n---\nAnswer:"
+        )
+        try:
+            lit_answer = client.chat.completions.create(
+                model=_model,
+                messages=[{"role": "user", "content": fallback_prompt}],
+                temperature=0.3,
+                max_tokens=1000,
+            ).choices[0].message.content
+        except Exception:
+            lit_answer = None
 
     # Protein identity fields
     prot_desc = up_features.get("proteinDescription", {})
@@ -394,7 +402,8 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
     if gpt_summary.get("Function"):
         text_summary += "**Functional notes:**\n" + "\n".join(f"- {b}" for b in gpt_summary["Function"]) + "\n"
     if lit_answer:
-        text_summary += f"**Literature answer:** {lit_answer[:400]}…\n"
+        label = "Annotation-based answer" if lit_answer_is_fallback else "Literature answer"
+        text_summary += f"**{label}:** {lit_answer[:400]}…\n"
 
     # ── Artifacts ──────────────────────────────────────────────────────────────
     # Tab 1: Literature & Catalysis
@@ -418,10 +427,15 @@ Return strictly as JSON with keys: "Structure", "Function", "Sequence". Each val
             "### Functional Roles\n" + "\n".join(f"- {b}" for b in gpt_summary["Function"])
         })
     if lit_answer:
-        tab1.append({"type": "markdown", "data": f"### Literature Answer\n{lit_answer}"})
-    elif doi != "N/A" and not paper_text:
+        header = (
+            "### Analysis _(paper unavailable — based on available annotations)_"
+            if lit_answer_is_fallback else
+            "### Literature Answer"
+        )
+        tab1.append({"type": "markdown", "data": f"{header}\n{lit_answer}"})
+    else:
         tab1.append({"type": "markdown", "data":
-            "_No open-access PDF found (tried Unpaywall + library cookie + Sci-Hub)._"
+            "_No answer could be generated — paper inaccessible and annotation context insufficient._"
         })
 
     # Tab 2: Sequence & Domains
