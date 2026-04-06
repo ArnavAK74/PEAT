@@ -429,6 +429,31 @@ def _is_hpc_command(text: str) -> bool:
     parts = text.strip().split()
     return bool(parts) and parts[0].lower() in _HPC_PREFIXES
 
+_AA_CHARS     = set("ACDEFGHIKLMNPQRSTVWY")
+_AA_THRESHOLD = 0.85   # fraction of non-whitespace chars that must be valid AAs
+_MIN_SEQ_LEN  = 20     # ignore anything shorter (avoids false positives on short words)
+
+def _parse_sequence_input(text: str) -> str | None:
+    """
+    Return the cleaned amino acid sequence if the message is a FASTA block or a
+    raw AA sequence; else None.
+
+    Handles:
+    - FASTA format: strips all header lines starting with '>'
+    - Raw sequence: accepts if >= 85% of characters are standard amino acids
+      and the sequence is at least 20 residues long
+    """
+    lines = text.strip().splitlines()
+    seq_lines = [l for l in lines if not l.startswith(">")]
+    seq = "".join(seq_lines).replace(" ", "").upper()
+
+    if len(seq) < _MIN_SEQ_LEN:
+        return None
+    valid = sum(1 for c in seq if c in _AA_CHARS)
+    if valid / len(seq) >= _AA_THRESHOLD:
+        return seq
+    return None
+
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -521,6 +546,7 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
     pdb_id        = _parse_analyze_request(prompt)
     foldseek_id   = _parse_foldseek_request(prompt)
     alphafold_id  = _parse_alphafold_request(prompt)
+    sequence      = _parse_sequence_input(prompt)
 
     # Route: HPC command (checked first — unambiguous prefix match)
     if _is_hpc_command(prompt):
@@ -616,6 +642,50 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
                     st.error(err)
                     st.session_state.messages.append({"role": "assistant", "content": err})
                     st.session_state.chat_display.append({"role": "assistant", "content": err})
+
+    # Route: sequence input (FASTA or raw AA) → BLAST → analysis
+    elif sequence and not pdb_id:
+        with st.chat_message("assistant"):
+            with st.spinner("Searching RCSB for a matching PDB…"):
+                found_id = get_pdb_id_from_sequence(sequence)
+            if not found_id:
+                err = "No matching PDB found for the provided sequence."
+                st.warning(err)
+                st.session_state.messages.append({"role": "assistant", "content": err})
+                st.session_state.chat_display.append({"role": "assistant", "content": err})
+            elif found_id in st.session_state.analyzed_pdb_ids:
+                # Already analyzed — let the LLM answer from context
+                with st.spinner("Thinking…"):
+                    try:
+                        resp = client.chat.completions.create(
+                            model=_model,
+                            messages=st.session_state.messages,
+                            temperature=0.3,
+                            max_tokens=1000,
+                        )
+                        answer = resp.choices[0].message.content
+                    except Exception as e:
+                        answer = f"LLM error: {e}"
+                st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+                st.session_state.chat_display.append({"role": "assistant", "content": answer})
+            else:
+                with st.spinner(f"Analyzing {found_id}…"):
+                    try:
+                        text_summary, artifacts = _run_analysis(found_id, prompt)
+                        st.markdown(text_summary)
+                        for artifact in artifacts:
+                            _render_artifact(artifact)
+                        st.session_state.analyzed_pdb_ids.add(found_id)
+                        st.session_state.messages.append({"role": "assistant", "content": text_summary})
+                        st.session_state.chat_display.append({
+                            "role": "assistant", "content": text_summary, "artifacts": artifacts,
+                        })
+                    except Exception as e:
+                        err = f"Analysis failed: {e}"
+                        st.error(err)
+                        st.session_state.messages.append({"role": "assistant", "content": err})
+                        st.session_state.chat_display.append({"role": "assistant", "content": err})
 
     # Route: LLM with full history (questions, follow-ups, already-analyzed PDB IDs)
     else:
