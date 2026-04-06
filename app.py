@@ -20,7 +20,12 @@ from structure_tools import build_3dmol_html
 from sequence_tools import conservation_scores, run_blast
 from predictors import predict_ddg_dynamut
 from ui import plot_domains, plot_conservation
-from hpc_tools import run_hpc_command
+from hpc_tools import (
+    run_hpc_command,
+    submit_minimization,
+    check_job_status,
+    download_job_results,
+)
 from bio_tools import foldseek_search, alphafold_fetch
 
 # ── LLM client ─────────────────────────────────────────────────────────────────
@@ -42,6 +47,32 @@ _HPC_PREFIXES = {
     "squeue", "sacct", "sbatch", "scancel",
     "echo", "ls", "cat", "head", "tail",
 }
+# Matches energy minimization requests:
+#   "minimize 7W13" | "run energy minimization on 7W13" | "energy minimize 7W13"
+_MINIMIZE_RE = re.compile(
+    r'^\s*'
+    r'(?:run\s+)?'
+    r'(?:energy\s+)?'
+    r'minimi[sz]e?\s+'
+    r'(?:on\s+)?(?:pdb\s+)?'
+    r'([0-9][A-Za-z0-9]{3})'
+    r'\s*$'
+    r'|^\s*run\s+energy\s+minimization\s+(?:on\s+)?(?:pdb\s+)?([0-9][A-Za-z0-9]{3})\s*$',
+    re.IGNORECASE,
+)
+
+# Matches job status checks: "check job 1234567" | "check status 1234567"
+_CHECK_JOB_RE = re.compile(
+    r'^\s*(?:check|job|query)\s+(?:job\s+|status\s+)?(\d+)\s*$',
+    re.IGNORECASE,
+)
+
+# Matches result downloads: "download results 1234567" | "get results 1234567"
+_DOWNLOAD_RE = re.compile(
+    r'^\s*(?:download|get|fetch)\s+results?\s+(\d+)\s*$',
+    re.IGNORECASE,
+)
+
 # Matches messages whose intent is to fetch an AlphaFold structure:
 #   "alphafold Q9WYE2" | "fetch alphafold Q9WYE2" | "af2 Q9WYE2"
 _ALPHAFOLD_RE = re.compile(
@@ -90,6 +121,9 @@ if "chat_display" not in st.session_state:
 if "analyzed_pdb_ids" not in st.session_state:
     # Set of PDB IDs already analyzed this session
     st.session_state.analyzed_pdb_ids = set()
+if "hpc_jobs" not in st.session_state:
+    # job_id → {"pdb_id": str, "remote_dir": str}
+    st.session_state.hpc_jobs = {}
 
 
 # ── RAG helper ──────────────────────────────────────────────────────────────────
@@ -503,6 +537,23 @@ def _is_hpc_command(text: str) -> bool:
     parts = text.strip().split()
     return bool(parts) and parts[0].lower() in _HPC_PREFIXES
 
+def _parse_minimize_request(text: str) -> str | None:
+    """Return PDB ID if message is an energy minimization request, else None."""
+    m = _MINIMIZE_RE.match(text)
+    if not m:
+        return None
+    return (m.group(1) or m.group(2)).upper()
+
+def _parse_check_job(text: str) -> str | None:
+    """Return job ID if message is a job status check, else None."""
+    m = _CHECK_JOB_RE.match(text)
+    return m.group(1) if m else None
+
+def _parse_download_results(text: str) -> str | None:
+    """Return job ID if message is a results download request, else None."""
+    m = _DOWNLOAD_RE.match(text)
+    return m.group(1) if m else None
+
 _AA_CHARS     = set("ACDEFGHIKLMNPQRSTVWY")
 _AA_THRESHOLD = 0.80   # fraction of characters that must be valid AAs
 _MIN_SEQ_LEN  = 20     # ignore anything shorter
@@ -639,6 +690,9 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
     foldseek_id   = _parse_foldseek_request(prompt)
     alphafold_id  = _parse_alphafold_request(prompt)
     sequence      = _parse_sequence_input(prompt)
+    minimize_id   = _parse_minimize_request(prompt)
+    check_job_id  = _parse_check_job(prompt)
+    download_id   = _parse_download_results(prompt)
 
     # Route: HPC command (checked first — unambiguous prefix match)
     if _is_hpc_command(prompt):
@@ -648,6 +702,68 @@ if prompt := st.chat_input("Ask about a protein (e.g. 'Analyze 6B5X') or run an 
             response = f"**HPC Output:**\n```bash\n{hpc_output}\n```"
             st.markdown(response)
             st.session_state.messages.append({"role": "assistant", "content": hpc_output})
+            st.session_state.chat_display.append({"role": "assistant", "content": response})
+
+    # Route: energy minimization submission
+    elif minimize_id:
+        with st.chat_message("assistant"):
+            with st.spinner(f"Submitting energy minimization for {minimize_id} to Anvil…"):
+                try:
+                    result = submit_minimization(minimize_id)
+                    job_id = result["job_id"]
+                    st.session_state.hpc_jobs[job_id] = {
+                        "pdb_id":     result["pdb_id"],
+                        "remote_dir": result["remote_dir"],
+                    }
+                    response = (
+                        f"**Energy minimization submitted for {minimize_id}.**\n\n"
+                        f"- **Job ID:** `{job_id}`\n"
+                        f"- **Remote dir:** `{result['remote_dir']}`\n"
+                        f"- **Steps:** 500 × steepest descent, vacuum, OPLS-AA force field\n\n"
+                        f"Check progress with: `check job {job_id}`\n"
+                        f"Download results with: `download results {job_id}`"
+                    )
+                except Exception as e:
+                    response = f"Minimization submission failed: {e}"
+            st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.session_state.chat_display.append({"role": "assistant", "content": response})
+
+    # Route: SLURM job status check
+    elif check_job_id:
+        with st.chat_message("assistant"):
+            with st.spinner(f"Checking job {check_job_id}…"):
+                try:
+                    status = check_job_status(check_job_id)
+                    response = f"**Job {check_job_id} status:**\n```\n{status}\n```"
+                except Exception as e:
+                    response = f"Job status check failed: {e}"
+            st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.session_state.chat_display.append({"role": "assistant", "content": response})
+
+    # Route: download job results
+    elif download_id:
+        with st.chat_message("assistant"):
+            with st.spinner(f"Downloading results for job {download_id}…"):
+                try:
+                    job_info = st.session_state.hpc_jobs.get(download_id)
+                    if not job_info:
+                        raise RuntimeError(
+                            f"No record of job {download_id} in this session. "
+                            "Submit a minimization first, or check the job ID."
+                        )
+                    dl = download_job_results(download_id, job_info["pdb_id"])
+                    file_list = "\n".join(f"- `{f}`" for f in dl["files"])
+                    response = (
+                        f"**Results downloaded for job {download_id}.**\n\n"
+                        f"Saved to: `{dl['local_dir']}`\n\n"
+                        f"{file_list if dl['files'] else '_No output files found._'}"
+                    )
+                except Exception as e:
+                    response = f"Download failed: {e}"
+            st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
             st.session_state.chat_display.append({"role": "assistant", "content": response})
 
     # Route: AlphaFold structure fetch
