@@ -1,4 +1,4 @@
-# hpc_tools.py
+# hpc_tools.py  (v2 — adds submit_minimization, check_job_status, download_job_results)
 """
 HPC command execution tool for PEAT.
 
