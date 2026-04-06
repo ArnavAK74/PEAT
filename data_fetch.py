@@ -126,5 +126,5 @@ def get_pdb_id_from_sequence(sequence: str) -> str | None:
         if hits:
             return hits[0]["identifier"]  # Return top hit
     except Exception as e:
-        st.warning(f"Sequence → PDB search failed: {e}")
+        print(f"Sequence → PDB search failed: {e}")
     return None
