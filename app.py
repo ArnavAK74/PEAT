@@ -30,8 +30,8 @@ from bio_tools import foldseek_search, alphafold_fetch
 
 # ── LLM client ─────────────────────────────────────────────────────────────────
 _api_key  = os.getenv("OPENROUTER_API_KEY", "")
-_base_url = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-_model    = os.getenv("LLM_MODEL", "mistralai/mistral-7b-instruct:free")
+_base_url = os.getenv("LLM_BASE_URL", "https://llm.jetstream-cloud.org/llama-4-scout/v1/")
+_model    = os.getenv("LLM_MODEL", "llama-4-scout")
 client    = OpenAI(api_key=_api_key, base_url=_base_url)
 EMAIL     = os.getenv("UNPAYWALL_EMAIL", "")
 
@@ -600,25 +600,9 @@ def _parse_sequence_input(text: str) -> str | None:
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Search by Sequence")
-    seq_input = st.text_area("Protein sequence (FASTA or plain AA)", height=140)
-    if st.button("Find & Analyze PDB"):
-        if seq_input.strip():
-            with st.spinner("Searching RCSB for matching PDB…"):
-                found_id = get_pdb_id_from_sequence(seq_input.strip())
-            if found_id:
-                st.success(f"Found: {found_id}")
-                st.session_state._pending_pdb = found_id
-                st.session_state._pending_question = "What is the function of this protein?"
-            else:
-                st.error("No matching PDB found.")
-        else:
-            st.warning("Enter a sequence first.")
-
-    st.markdown("---")
     st.caption(
-        "Or type a PDB ID (e.g. `Analyze 6B5X`) or an HPC command "
-        "(e.g. `gmx mdrun -deffnm em`) directly in the chat below."
+        "Type a PDB ID (e.g. `Analyze 6B5X`), a protein sequence (FASTA or plain AA), "
+        "or an HPC command (e.g. `gmx mdrun -deffnm em`) directly in the chat below."
     )
 
 
@@ -629,53 +613,6 @@ for item in st.session_state.chat_display:
             st.markdown(item["content"])
         for artifact in item.get("artifacts", []):
             _render_artifact(artifact)
-
-
-# ── Handle sequence → PDB injection from sidebar ───────────────────────────────
-if hasattr(st.session_state, "_pending_pdb"):
-    pdb_id   = st.session_state.pop("_pending_pdb")
-    question = st.session_state.pop("_pending_question", "")
-    user_msg = f"Analyze {pdb_id}" + (f" — {question}" if question else "")
-
-    st.session_state.messages.append({"role": "user", "content": user_msg})
-    st.session_state.chat_display.append({"role": "user", "content": user_msg})
-    with st.chat_message("user"):
-        st.markdown(user_msg)
-
-    with st.chat_message("assistant"):
-        if pdb_id in st.session_state.analyzed_pdb_ids:
-            with st.spinner("Thinking…"):
-                try:
-                    resp = client.chat.completions.create(
-                        model=_model,
-                        messages=st.session_state.messages,
-                        temperature=0.3,
-                        max_tokens=1000,
-                    )
-                    answer = resp.choices[0].message.content
-                except Exception as e:
-                    answer = f"LLM error: {e}"
-            st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.session_state.chat_display.append({"role": "assistant", "content": answer})
-        else:
-            with st.spinner(f"Analyzing {pdb_id}…"):
-                try:
-                    text_summary, artifacts = _run_analysis(pdb_id, question)
-                    st.markdown(text_summary)
-                    for artifact in artifacts:
-                        _render_artifact(artifact)
-                    st.session_state.analyzed_pdb_ids.add(pdb_id)
-                    st.session_state.messages.append({"role": "assistant", "content": text_summary})
-                    st.session_state.chat_display.append({
-                        "role": "assistant", "content": text_summary, "artifacts": artifacts,
-                    })
-                except Exception as e:
-                    err = f"Analysis failed: {e}"
-                    st.error(err)
-                    st.session_state.messages.append({"role": "assistant", "content": err})
-                    st.session_state.chat_display.append({"role": "assistant", "content": err})
-    st.rerun()
 
 
 # ── Chat input loop ─────────────────────────────────────────────────────────────
