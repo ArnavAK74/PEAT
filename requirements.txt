@@ -19,3 +19,4 @@ requests==2.32.4
 
 # Misc
 python-dotenv==1.1.1
+globus-compute-sdk>=2.0.0
